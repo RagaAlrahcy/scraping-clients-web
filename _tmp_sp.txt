@@ -1,0 +1,589 @@
+"""Scraper sederhana: website -> data bisnis.
+
+Fokus modul ini hanya mengambil informasi bisnis dari SATU halaman website
+memakai requests + BeautifulSoup. Tidak ada Selenium, Playwright, proxy,
+bypass CAPTCHA, atau scraping concurrent.
+
+Alur: scrape(url) -> fetch HTML -> parse -> bersihkan -> dict data bisnis.
+Field yang tidak ditemukan diisi dengan DEFAULT_EMPTY ("-").
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
+
+import requests
+from bs4 import BeautifulSoup
+
+# ---------------------------------------------------------------------------
+# Konstanta
+# ---------------------------------------------------------------------------
+DEFAULT_EMPTY = "-"
+DEFAULT_TIMEOUT = 15  # detik
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+    ),
+    "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# Pemisah nomor telepon/alamat yang berlebihan dibersihkan.
+_WHITESPACE_RE = re.compile(r"\s+")
+
+# Email: pola umum, hindari yang jelas bukan email (mis. nama file gambar).
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+# Nomor telepon Indonesia: +62 / 62 / 0 lalu 8xx, atau nomor kantor (21, 22, ...).
+_PHONE_RE = re.compile(
+    r"(?:\+?62|0)[\s\-.]?(?:8[\d\s\-.]{7,14}|(?:\d{2,3})[\s\-.]?\d{3,4}[\s\-.]?\d{3,4})"
+)
+
+# Domain yang sering muncul di halaman tapi bukan email bisnis.
+_EMAIL_BLOCKLIST_DOMAINS = ("example.com", "contoh.com", "sentry.io", "wixpress.com")
+_EMAIL_BLOCKLIST_PREFIXES = ("noreply", "no-reply", "donotreply", "your-email")
+_EMAIL_BLOCKLIST_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css", ".js")
+
+
+class ScraperError(Exception):
+    """Error umum pada WebsiteScraper."""
+
+
+class InvalidUrlError(ScraperError):
+    """URL tidak valid atau kosong."""
+
+
+@dataclass
+class ScrapeResult:
+    """Hasil satu kali scraping.
+
+    Attributes:
+        url: URL final yang dipakai (setelah normalisasi).
+        success: True bila HTML berhasil diambil dan di-parsing.
+        data: dict data bisnis (selalu berisi semua field, "-" bila kosong).
+        error: pesan error bila success=False.
+    """
+
+    url: str
+    success: bool
+    data: Dict[str, str] = field(default_factory=dict)
+    error: Optional[str] = None
+
+    def as_row(self) -> Dict[str, str]:
+        """Kembalikan data siap dipetakan ke kolom Google Sheets."""
+        return dict(self.data)
+
+
+class WebsiteScraper:
+    """Ambil informasi bisnis dari satu halaman website.
+
+    Pemakaian:
+        scraper = WebsiteScraper()
+        result = scraper.scrape("https://example.com")
+        if result.success:
+            print(result.data)
+
+    Class ini tidak pernah melempar exception jaringan ke pemanggil:
+    semua kegagalan dikembalikan sebagai ScrapeResult(success=False).
+    """
+
+    def __init__(
+        self,
+        timeout: int = DEFAULT_TIMEOUT,
+        headers: Optional[Dict[str, str]] = None,
+        session: Optional[requests.Session] = None,
+    ) -> None:
+        self.timeout = timeout
+        self.headers = dict(headers or DEFAULT_HEADERS)
+        # Session dipakai agar koneksi TCP di-reuse untuk beberapa URL berturut-turut.
+        self.session = session or requests.Session()
+        self.session.headers.update(self.headers)
+
+    # ------------------------------------------------------------------
+    # Fungsi utama
+    # ------------------------------------------------------------------
+    def scrape(self, url: str) -> ScrapeResult:
+        """Scrape satu URL dan kembalikan ScrapeResult.
+
+        Tidak melempar exception untuk kegagalan yang sudah ditangani
+        (URL salah, timeout, HTTP error, koneksi gagal). Exception tak terduga
+        dari BeautifulSoup juga ditangkap agar loop di main.py tidak berhenti.
+        """
+        # 1) Validasi & normalisasi URL
+        try:
+            normalized = self.normalize_url(url)
+        except InvalidUrlError as exc:
+            return ScrapeResult(
+                url=str(url), success=False, error=f"URL tidak valid: {exc}"
+            )
+
+        # 2) Ambil HTML
+        try:
+            html = self.fetch(normalized)
+        except requests.exceptions.Timeout:
+            return ScrapeResult(
+                url=normalized,
+                success=False,
+                error=f"Timeout setelah {self.timeout} detik (server tidak merespons)",
+            )
+        except requests.exceptions.SSLError as exc:
+            return ScrapeResult(
+                url=normalized, success=False, error=f"SSL error: {self._short(exc)}"
+            )
+        except requests.exceptions.ConnectionError as exc:
+            return ScrapeResult(
+                url=normalized,
+                success=False,
+                error=f"Website tidak bisa diakses / DNS gagal: {self._short(exc)}",
+            )
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "?"
+            return ScrapeResult(
+                url=normalized, success=False, error=f"HTTP error {status}"
+            )
+        except requests.exceptions.RequestException as exc:
+            return ScrapeResult(
+                url=normalized,
+                success=False,
+                error=f"Gagal mengambil halaman: {self._short(exc)}",
+            )
+
+        # 3) Parsing + ekstraksi
+        try:
+            data = self.extract(html, normalized)
+        except Exception as exc:  # noqa: BLE001 - jangan hentikan program
+            return ScrapeResult(
+                url=normalized,
+                success=False,
+                error=f"Gagal parsing HTML: {self._short(exc)}",
+            )
+
+        return ScrapeResult(url=normalized, success=True, data=data)
+
+    # ------------------------------------------------------------------
+    # URL
+    # ------------------------------------------------------------------
+    @staticmethod
+    def normalize_url(url: str) -> str:
+        """Rapikan URL: tambah https:// bila skema belum ada, buang trailing slash.
+
+        Raise InvalidUrlError bila URL kosong atau tidak punya domain valid.
+        """
+        if url is None or not str(url).strip():
+            raise InvalidUrlError("URL kosong")
+
+        candidate = str(url).strip().replace(" ", "")
+        if not candidate:
+            raise InvalidUrlError("URL kosong")
+
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", candidate):
+            candidate = f"https://{candidate}"
+
+        parsed = urlparse(candidate)
+
+        if parsed.scheme not in ("http", "https"):
+            raise InvalidUrlError(
+                f"skema '{parsed.scheme}' tidak didukung (hanya http/https)"
+            )
+
+        host = parsed.netloc.split("@")[-1].split(":")[0]
+        if not host or "." not in host:
+            raise InvalidUrlError("domain tidak valid (contoh benar: example.com)")
+
+        # Buang fragment (#...) dan trailing slash; query dibiarkan apa adanya.
+        return urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc.lower(),
+                parsed.path.rstrip("/"),
+                parsed.params,
+                parsed.query,
+                "",
+            )
+        )
+
+    @classmethod
+    def is_valid_url(cls, url: str) -> bool:
+        """True bila URL bisa dinormalisasi."""
+        try:
+            cls.normalize_url(url)
+            return True
+        except InvalidUrlError:
+            return False
+
+    @staticmethod
+    def site_key(url: str) -> str:
+        """Kunci anti-duplikat: domain + path, tanpa www/skema/trailing slash.
+
+        Dipakai supaya 'https://x.com', 'http://www.x.com/' dan 'x.com'
+        dianggap website yang sama.
+        """
+        candidate = url if "//" in str(url) else f"https://{url}"
+        parsed = urlparse(candidate)
+        netloc = parsed.netloc.split("@")[-1].lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = (parsed.path or "").rstrip("/").lower()
+        return f"{netloc}{path}"
+
+    # ------------------------------------------------------------------
+    # HTTP
+    # ------------------------------------------------------------------
+    def fetch(self, url: str) -> str:
+        """Ambil HTML dari URL (raise RequestException bila gagal)."""
+        response = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+        response.raise_for_status()
+
+        # requests kadang salah menebak encoding; pakai apparent_encoding untuk
+        # halaman berbahasa Indonesia yang tidak mendeklarasikan charset.
+        if not response.encoding or response.encoding.lower() == "iso-8859-1":
+            response.encoding = response.apparent_encoding or "utf-8"
+
+        return response.text
+
+    @staticmethod
+    def _short(exc: Exception, limit: int = 160) -> str:
+        """Ringkas pesan exception agar terminal tetap rapi."""
+        text = _WHITESPACE_RE.sub(" ", str(exc)).strip()
+        return text[:limit] + ("..." if len(text) > limit else "")
+
+    # ------------------------------------------------------------------
+    # Ekstraksi data bisnis
+    # ------------------------------------------------------------------
+    def extract(self, html: str, url: str) -> Dict[str, str]:
+        """Parse HTML dan kembalikan dict lengkap data bisnis.
+
+        Semua field selalu ada; yang tidak ditemukan bernilai DEFAULT_EMPTY.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+
+        data = {
+            "Nama Bisnis": self._clean_text(self.extract_name(soup, url), url=True),
+            "Website": url,
+            "Email": self.extract_email(soup),
+            "Nomor Telepon": self.extract_phone(soup),
+            "Alamat": self.extract_address(soup),
+        }
+        return {key: (value if value else DEFAULT_EMPTY) for key, value in data.items()}
+
+    def extract_name(self, soup: BeautifulSoup, url: str) -> str:
+        """Nama bisnis: og:site_name -> JSON-LD -> title -> h1 -> domain."""
+        # 1) Open Graph
+        og = soup.find("meta", attrs={"property": "og:site_name"})
+        if og and og.get("content"):
+            return str(og["content"])
+
+        # 2) schema.org LocalBusiness/Organization (JSON-LD atau microdata)
+        for selector in (
+            'script[type="application/ld+json"]',
+            '[itemprop="name"]',
+        ):
+            for node in soup.select(selector):
+                if node.name == "script":
+                    import json as _json
+
+                    try:
+                        payload = _json.loads(node.string or "{}")
+                    except (ValueError, TypeError):
+                        continue
+                    name = self._name_from_jsonld(payload)
+                else:
+                    name = node.get("content") or node.get_text()
+                if name and str(name).strip():
+                    return str(name).strip()
+
+        # 3) <title> (buang suffix setelah pemisah umum)
+        if soup.title and soup.title.string:
+            title = str(soup.title.string).strip()
+            if title:
+                for sep in ("|", "–", "—", "-", "·", ":"):
+                    if sep in title:
+                        head = title.split(sep)[0].strip()
+                        if len(head) >= 3:
+                            return head
+                return title
+
+        # 4) <h1> pertama
+        h1 = soup.find("h1")
+        if h1 and h1.get_text(strip=True):
+            return h1.get_text(strip=True)
+
+        # 5) Fallback: domain (mis. "example.com" -> "Example")
+        host = urlparse(url).netloc.split(":")[0]
+        label = host[4:] if host.startswith("www.") else host
+        label = label.split(".")[0]
+        return label.replace("-", " ").title() if label else DEFAULT_EMPTY
+
+    @staticmethod
+    def _name_from_jsonld(payload: Any) -> Optional[str]:
+        """Ambil 'name' dari struktur JSON-LD (dict, list, atau @graph)."""
+        if isinstance(payload, list):
+            for item in payload:
+                name = WebsiteScraper._name_from_jsonld(item)
+                if name:
+                    return name
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        # Prioritaskan tipe bisnis lokal bila ada.
+        raw_type = str(payload.get("@type", "")).lower()
+        if any(
+            keyword in raw_type
+            for keyword in ("business", "organization", "store", "clinic", "medical")
+        ) and payload.get("name"):
+            return str(payload["name"])
+
+        if payload.get("name"):
+            return str(payload["name"])
+
+        graph = payload.get("@graph")
+        if graph:
+            return WebsiteScraper._name_from_jsonld(graph)
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Email
+    # ------------------------------------------------------------------
+    def extract_email(self, soup: BeautifulSoup) -> str:
+        """Email: mailto: -> teks halaman -> meta/JSON-LD."""
+        candidates: List[str] = []
+
+        # 1) Link mailto (paling dapat dipercaya)
+        for link in soup.select('a[href^="mailto:"]'):
+            href = str(link.get("href", ""))
+            raw = href[len("mailto:") :]
+            for part in re.split(r"[,;]", raw):
+                email = part.strip().split("?")[0]
+                if email:
+                    candidates.append(email)
+
+        if not candidates:
+            # 2) Teks halaman (termasuk isi JSON-LD yang tidak di-parse)
+            candidates.extend(_EMAIL_RE.findall(soup.get_text(" ", strip=True)))
+
+        if not candidates:
+            # 3) Meta data (schema.org email)
+            for node in soup.select('[itemprop="email"], meta[property*="email"]'):
+                value = node.get("content") or node.get_text()
+                candidates.extend(_EMAIL_RE.findall(str(value)))
+
+        return self._pick_email(candidates)
+
+    @staticmethod
+    def _pick_email(candidates: List[str]) -> str:
+        """Filter kandidat email dan pilih yang paling masuk akal."""
+        seen: List[str] = []
+        for raw in candidates:
+            email = raw.strip().strip(".,;:").lower()
+            if not email or "@" not in email:
+                continue
+            if email.endswith(_EMAIL_BLOCKLIST_SUFFIXES):
+                continue
+            local, _, domain = email.partition("@")
+            if not local or not domain:
+                continue
+            if domain in _EMAIL_BLOCKLIST_DOMAINS:
+                continue
+            if local.startswith(_EMAIL_BLOCKLIST_PREFIXES):
+                continue
+            if email not in seen:
+                seen.append(email)
+
+        return seen[0] if seen else ""
+
+    # ------------------------------------------------------------------
+    # Nomor telepon
+    # ------------------------------------------------------------------
+    def extract_phone(self, soup: BeautifulSoup) -> str:
+        """Nomor telepon: link tel: -> itemprop/meta -> teks halaman."""
+        # 1) Link tel: (paling akurat)
+        for link in soup.select('a[href^="tel:"]'):
+            href = str(link.get("href", ""))
+            phone = self._clean_phone(href[len("tel:") :])
+            if phone:
+                return phone
+
+        # 2) schema.org telephone
+        for node in soup.select('[itemprop="telephone"], meta[property*="telephone"]'):
+            phone = self._clean_phone(str(node.get("content") or node.get_text()))
+            if phone:
+                return phone
+
+        # 3) Cari di teks halaman
+        match = _PHONE_RE.search(soup.get_text(" ", strip=True))
+        if match:
+            phone = self._clean_phone(match.group(0))
+            if phone:
+                return phone
+
+        return ""
+
+    @staticmethod
+    def _clean_phone(raw: str) -> str:
+        """Rapikan nomor telepon; kembalikan "" bila tidak wajar."""
+        candidate = _WHITESPACE_RE.sub(" ", str(raw)).strip().split("?")[0].strip()
+
+        digits = re.sub(r"\D", "", candidate)
+        # Panjang wajar nomor Indonesia: 8-15 digit (termasuk kode negara).
+        if len(digits) < 8 or len(digits) > 15:
+            return ""
+
+        if digits.startswith("62"):
+            return f"+62 {digits[2:]}"
+        if digits.startswith("0"):
+            return f"+62 {digits[1:]}"
+        return f"+62 {digits}"
+
+    # ------------------------------------------------------------------
+    # Alamat
+    # ------------------------------------------------------------------
+    def extract_address(self, soup: BeautifulSoup) -> str:
+        """Alamat: <address> -> schema.org -> heuristic teks Indonesia."""
+        # 1) Tag <address>
+        tag = soup.find("address")
+        if tag:
+            text = self._clean_text(tag.get_text(" ", strip=True))
+            if text:
+                return text
+
+        # 2) itemprop address / streetAddress
+        for selector in ("[itemprop='address']", "[itemprop='streetAddress']"):
+            for node in soup.select(selector):
+                text = self._clean_text(str(node.get("content") or node.get_text(" ")))
+                if text:
+                    return text
+
+        # 3) JSON-LD address
+        address = self._address_from_jsonld(soup)
+        if address:
+            return address
+
+        # 4) Heuristic terakhir
+        return self._address_from_text(soup)
+
+    @staticmethod
+    def _walk_address(payload: Any) -> List[Any]:
+        """Kumpulkan semua nilai 'address' dari struktur JSON-LD."""
+        found: List[Any] = []
+
+        if isinstance(payload, list):
+            for item in payload:
+                found.extend(WebsiteScraper._walk_address(item))
+            return found
+
+        if not isinstance(payload, dict):
+            return found
+
+        if payload.get("address"):
+            found.append(payload["address"])
+
+        for key in ("@graph", "location", "branch"):
+            if key in payload:
+                found.extend(WebsiteScraper._walk_address(payload[key]))
+
+        return found
+
+    @staticmethod
+    def _format_postal_address(address: Any) -> str:
+        """Format objek PostalAddress schema.org menjadi satu baris alamat."""
+        if isinstance(address, str):
+            return WebsiteScraper._clean_text(address)
+
+        if not isinstance(address, dict):
+            return ""
+
+        street = address.get("streetAddress", "")
+        if isinstance(street, list):
+            street = ", ".join(str(part) for part in street)
+
+        parts = [
+            street,
+            address.get("addressLocality"),
+            address.get("addressRegion"),
+            address.get("postalCode"),
+            address.get("addressCountry"),
+        ]
+        text = ", ".join(str(part).strip() for part in parts if part)
+        return WebsiteScraper._clean_text(text)
+
+    @staticmethod
+    def _address_from_jsonld(soup: BeautifulSoup) -> str:
+        """Ambil address dari blok JSON-LD schema.org."""
+        import json as _json
+
+        for node in soup.select('script[type="application/ld+json"]'):
+            try:
+                payload = _json.loads(node.string or "{}")
+            except (ValueError, TypeError):
+                continue
+
+            for address in WebsiteScraper._walk_address(payload):
+                text = WebsiteScraper._format_postal_address(address)
+                if text:
+                    return text
+        return ""
+
+    def _address_from_text(self, soup: BeautifulSoup) -> str:
+        """Heuristic: cari elemen teks yang mirip alamat (kata kunci Indonesia)."""
+        keywords = (
+            "jl.",
+            "jalan",
+            "alamat",
+            "address",
+            "kecamatan",
+            "kelurahan",
+            "kabupaten",
+            "rt.",
+            "rw.",
+        )
+
+        for node in soup.find_all(["p", "div", "span", "li", "td"], limit=400):
+            # Lewati container bersarang agar tidak mengambil seluruh halaman.
+            if node.find(("p", "div", "li")) is not None:
+                continue
+
+            text = self._clean_text(node.get_text(" ", strip=True))
+            if not text or not (15 <= len(text) <= 200):
+                continue
+
+            if any(keyword in text.lower() for keyword in keywords):
+                return text
+
+        return ""
+
+    # ------------------------------------------------------------------
+    # Helper teks
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clean_text(text: str, url: bool = False) -> str:
+        """Rapikan teks: normalisasi spasi dan buang artefak umum."""
+        if text is None:
+            return ""
+
+        cleaned = (
+            str(text)
+            .replace("\xa0", " ")
+            .replace("\u200b", "")
+            .replace("\r", " ")
+            .replace("\n", " ")
+            .replace("\t", " ")
+        )
+        cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
+
+        if url:
+            # Buang suffix SEO yang umum: "Klinik Contoh | Jakarta Selatan"
+            for sep in (" | ", " – ", " — ", " - "):
+                head = cleaned.split(sep)[0].strip()
+                if sep in cleaned and len(head) >= 3:
+                    cleaned = head
+                    break
+
+        return cleaned.strip(" \t\"'|-,;·")

@@ -1,0 +1,185 @@
+        return False
+    except SheetsError as exc:
+        print("[ERROR] Gagal memeriksa/membuat header.")
+        print(exc)
+        return False
+
+    return True
+
+
+def print_result(result: Any) -> None:
+    """Tampilkan hasil scraping di terminal."""
+    if not result.success:
+        print(f"     Hasil  : GAGAL -> {result.error}")
+        return
+
+    for key, value in result.data.items():
+        print(f"     {key:<15}: {value}")
+
+
+def process_url(
+    url: str,
+    scraper: WebsiteScraper,
+    manager: Optional[GoogleSheetsManager],
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Scrape satu URL lalu INSERT/SKIP di Google Sheets.
+
+    Return dict ringkasan: {url, name, status, row, data, error}.
+    Fungsi ini tidak melempar exception: semua error Google Sheets
+    ditangkap dan dikembalikan sebagai status GAGAL.
+    """
+    summary: Dict[str, Any] = {
+        "url": url,
+        "name": url,
+        "status": STATUS_FAILED,
+        "row": -1,
+        "data": {},
+        "error": None,
+    }
+
+    # 1) Scrape
+    result = scraper.scrape(url)
+    print(f"     URL    : {result.url}")
+    print_result(result)
+
+    if not result.success:
+        summary["error"] = result.error
+        return summary
+
+    row_data = result.as_row()
+    summary["data"] = row_data
+
+    # 2) Lengkapi kolom yang tidak diisi scraper agar tidak ada sel kosong.
+    for column in ("Nama Bisnis", "Kategori", "Kota", "Website", "Email",
+                   "Nomor Telepon", "Alamat"):
+        if not str(row_data.get(column, "")).strip():
+            row_data[column] = config.EMPTY_VALUE
+    row_data["Status"] = config.STATUS_DEFAULT
+    summary["name"] = row_data["Nama Bisnis"]
+
+    if dry_run:
+        summary["status"] = STATUS_DRY_RUN
+        print("     Sheet  : DRY-RUN (tidak menulis ke Google Sheets)")
+        return summary
+
+    if manager is None:
+        summary["error"] = "GoogleSheetsManager tidak tersedia (dry-run?)."
+        print("     Sheet  : GAGAL -> manager tidak tersedia")
+        return summary
+
+    # 3) Anti-duplikat + insert
+    try:
+        existing_row = manager.find_row_by_website(result.url)
+        if existing_row > 0:
+            summary["status"] = STATUS_SKIPPED
+            summary["row"] = existing_row
+            print(f"     Sheet  : sudah ada di baris {existing_row} -> SKIP")
+            return summary
+
+        written_row = manager.append_row(row_data)
+
+        summary["status"] = STATUS_INSERTED
+        summary["row"] = written_row
+        print(
+            f"     Sheet  : INSERT baris {written_row if written_row > 0 else '?'} "
+            f"(Status: {config.STATUS_DEFAULT})"
+        )
+    except SheetsError as exc:
+        summary["error"] = f"Google Sheets error: {exc}"
+        print(f"     Sheet  : GAGAL -> {exc}")
+    except Exception as exc:  # noqa: BLE001 - jaga loop tetap berjalan
+        summary["error"] = f"Error tidak terduga: {exc}"
+        print(f"     Sheet  : GAGAL -> {exc}")
+
+    return summary
+
+
+def process_candidate(
+    candidate: BusinessCandidate,
+    manager: Optional[GoogleSheetsManager],
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """INSERT/SKIP satu BusinessCandidate hasil discovery di Google Sheets.
+
+    Anti-duplikat: bisnis yang punya website dicek lewat
+    `find_row_by_website()`; bisnis tanpa website ("-") dicek lewat
+    `find_row_by_identity()` (nama + kota) karena tidak ada kunci URL.
+
+    Return dict ringkasan: {url, name, status, row, data, error}.
+    Fungsi ini tidak melempar exception: semua error Google Sheets ditangkap
+    dan dikembalikan sebagai status GAGAL.
+    """
+    row_data = candidate.as_row()
+    summary: Dict[str, Any] = {
+        "url": candidate.website if candidate.website not in ("", "-") else candidate.name,
+        "name": candidate.name,
+        "status": STATUS_FAILED,
+        "row": -1,
+        "data": row_data,
+        "error": None,
+    }
+
+    # Kolom yang belum diisi diisi EMPTY_VALUE supaya tidak ada sel kosong.
+    for column in ("Nama Bisnis", "Kategori", "Kota", "Website", "Email",
+                   "Nomor Telepon", "Alamat"):
+        if not str(row_data.get(column, "")).strip():
+            row_data[column] = config.EMPTY_VALUE
+    row_data["Status"] = config.STATUS_DEFAULT
+
+    print(f"     Nama    : {row_data['Nama Bisnis']}")
+    print(f"     Kategori: {row_data['Kategori']} | Kota: {row_data['Kota']}")
+    print(f"     Website : {row_data['Website']}")
+    print(f"     Email   : {row_data['Email']} | Telepon: {row_data['Nomor Telepon']}")
+    print(f"     Alamat  : {row_data['Alamat']}")
+    if str(candidate.status or "").strip() not in ("", "-"):
+        print(f"     Catatan : {candidate.status}")
+
+    if dry_run:
+        summary["status"] = STATUS_DRY_RUN
+        print("     Sheet   : DRY-RUN (tidak menulis ke Google Sheets)")
+        return summary
+
+    if manager is None:
+        summary["error"] = "GoogleSheetsManager tidak tersedia (dry-run?)."
+        print("     Sheet   : GAGAL -> manager tidak tersedia")
+        return summary
+
+    try:
+        # 1) Anti-duplikat
+        if row_data["Website"] != config.EMPTY_VALUE:
+            existing_row = manager.find_row_by_website(row_data["Website"])
+        else:
+            existing_row = manager.find_row_by_identity(
+                row_data["Nama Bisnis"], row_data["Kota"]
+            )
+
+        if existing_row > 0:
+            summary["status"] = STATUS_SKIPPED
+            summary["row"] = existing_row
+            print(f"     Sheet   : sudah ada di baris {existing_row} -> SKIP")
+            return summary
+
+        # 2) Insert baris baru
+        written_row = manager.append_row(row_data)
+        summary["status"] = STATUS_INSERTED
+        summary["row"] = written_row
+        print(
+            f"     Sheet   : INSERT baris {written_row if written_row > 0 else '?'} "
+            f"(Status: {config.STATUS_DEFAULT})"
+        )
+    except SheetsError as exc:
+        summary["error"] = f"Google Sheets error: {exc}"
+        print(f"     Sheet   : GAGAL -> {exc}")
+    except Exception as exc:  # noqa: BLE001 - jaga loop tetap berjalan
+        summary["error"] = f"Error tidak terduga: {exc}"
+        print(f"     Sheet   : GAGAL -> {exc}")
+
+    return summary
+
+
+def print_summary(summaries: List[Dict[str, Any]]) -> None:
+    """Cetak tabel ringkasan hasil proses."""
+    if not summaries:
+        print("Tidak ada bisnis/URL untuk diproses.")
+        return

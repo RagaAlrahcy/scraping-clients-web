@@ -1,0 +1,55 @@
+            return [], 0, 0, ""
+
+        payload, url = self._overpass_request(query)
+        if payload is None:
+            return [], 0, 0, ""
+
+        elements = payload.get("elements") or []
+        candidates, skipped = self.to_candidates(
+            elements, location, fallback_category=fallback_category
+        )
+        return candidates, len(elements), skipped, url
+
+    def discover(
+        self,
+        query_text: str,
+        limit: int = 50,
+        keyword: Optional[str] = None,
+        enrich_emails: bool = True,
+        scraper: Optional[WebsiteScraper] = None,
+    ) -> DiscoveryResult:
+        """Cari bisnis dari kalimat pencarian bebas.
+
+        Args:
+            query_text: mis. "klinik jakarta selatan".
+            limit: jumlah maksimum baris yang dikembalikan.
+            keyword: paksa kategori tertentu (mengabaikan deteksi otomatis).
+            enrich_emails: lengkapi email via WebsiteScraper bila tag OSM kosong.
+            scraper: instance WebsiteScraper yang dipakai ulang (opsional).
+
+        Return DiscoveryResult - tidak pernah melempar exception jaringan.
+        """
+        self.last_errors = []
+        self.last_overpass_url = ""
+
+        raw_query = str(query_text or "").strip()
+        if not raw_query:
+            return DiscoveryResult(
+                query=raw_query, errors=["Kata kunci pencarian kosong."]
+            )
+
+        # 1) Pisahkan kategori + nama daerah.
+        if keyword:
+            category = build_category(keyword)
+            place = strip_keyword(raw_query, detect_keyword(raw_query) or category)
+        else:
+            category, place = parse_query(raw_query)
+
+        # Kata kunci WAJIB dibuang sebelum geocode; kalau tidak, Nominatim
+        # mengembalikan POI (mis. "klinik jakarta selatan" -> klinik, bukan kota).
+        if not place:
+            place = raw_query
+        if category is None:
+            category = build_category(place)
+
+        result = DiscoveryResult(query=raw_query, category=category)

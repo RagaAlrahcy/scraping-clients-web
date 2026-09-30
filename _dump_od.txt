@@ -1,0 +1,309 @@
+352|     def _overpass_request(self, query: str) -> Tuple[Optional[Dict[str, Any]], str]:
+353|         """Kirim query ke mirror Overpass berurutan. Return (payload, url)."""
+354|         last_error = ""
+355| 
+356|         for index, url in enumerate(self.overpass_urls):
+357|             try:
+358|                 response = self.session.post(
+359|                     url, data={"data": query}, timeout=self.timeout
+360|                 )
+361|             except requests.exceptions.Timeout:
+362|                 last_error = f"timeout setelah {self.timeout} detik di {url}"
+363|                 self._backoff(index)
+364|                 continue
+365|             except requests.exceptions.RequestException as exc:
+366|                 last_error = f"{url} -> {self._short(exc)}"
+367|                 self._backoff(index)
+368|                 continue
+369| 
+370|             if response.status_code in _RETRYABLE_STATUS:
+371|                 last_error = f"{url} -> HTTP {response.status_code} (dibatasi/ditolak)"
+372|                 self._backoff(index)
+373|                 continue
+374| 
+375|             if response.status_code != 200:
+376|                 last_error = f"{url} -> HTTP {response.status_code}"
+377|                 continue
+378| 
+379|             try:
+380|                 payload = response.json()
+381|             except ValueError:
+382|                 last_error = f"{url} -> respons bukan JSON"
+383|                 self._backoff(index)
+384|                 continue
+385| 
+386|             if "elements" not in payload:
+387|                 remark = str(payload.get("remark") or "").strip()
+388|                 last_error = f"{url} -> respons tanpa 'elements' {remark}".strip()
+389|                 self._backoff(index)
+390|                 continue
+391| 
+392|             return payload, url
+393| 
+394|         if last_error:
+395|             self.last_errors.append(f"Overpass gagal: {last_error}")
+396|         return None, ""
+397| 
+398|     def _backoff(self, index: int) -> None:
+399|         """Jeda sopan sebelum mencoba mirror berikutnya."""
+400|         if index < len(RETRY_BACKOFF):
+401|             time.sleep(RETRY_BACKOFF[index])
+402| 
+403|     # ------------------------------------------------------------------
+404|     # Tahap 3: konversi elemen OSM -> BusinessCandidate
+405|     # ------------------------------------------------------------------
+406|     def to_candidates(
+407|         self,
+408|         elements: Iterable[Dict[str, Any]],
+409|         location: Location,
+410|         fallback_category: Optional[str] = None,
+411|     ) -> Tuple[List[BusinessCandidate], int]:
+412|         """Ubah elemen OSM menjadi kandidat bisnis.
+413| 
+414|         Return (kandidat, jumlah elemen yang dibuang karena tanpa nama).
+415|         """
+416|         candidates: List[BusinessCandidate] = []
+417|         skipped = 0
+418| 
+419|         for element in elements:
+420|             tags = element.get("tags") or {}
+421|             if not isinstance(tags, dict) or not tags:
+422|                 continue
+423| 
+424|             name = self._clean(
+425|                 tags.get("name") or tags.get("name:id") or tags.get("operator")
+426|             )
+427|             if not name:
+428|                 skipped += 1
+429|                 continue
+430| 
+431|             if self._is_inactive(tags):
+432|                 continue
+433| 
+434|             website = self._first_url(
+435|                 tags.get("website"),
+436|                 tags.get("contact:website"),
+437|                 tags.get("url"),
+438|             )
+439|             email = self._first_email(tags.get("email"), tags.get("contact:email"))
+440|             phone = self._clean(
+441|                 tags.get("phone")
+442|                 or tags.get("contact:phone")
+443|                 or tags.get("contact:mobile")
+444|             )
+445|             lat, lon = self._coordinates(element)
+446| 
+447|             candidates.append(
+448|                 BusinessCandidate(
+449|                     name=name,
+450|                     category=category_from_tags(tags) or fallback_category or "-",
+451|                     city=location.city or "-",
+452|                     website=website or "-",
+453|                     email=email or "-",
+454|                     phone=phone or "-",
+455|                     address=self._build_address(tags) or "-",
+456|                     status="-",
+457|                     osm_type=str(element.get("type") or ""),
+458|                     osm_id=int(element.get("id") or 0),
+459|                     lat=lat,
+460|                     lon=lon,
+461|                 )
+462|             )
+463| 
+464|         return candidates, skipped
+465| 
+466|     @staticmethod
+467|     def _clean(value: Any) -> str:
+468|         """Rapikan nilai tag OSM (buang spasi/tanda pisah berlebih)."""
+469|         if value is None:
+470|             return ""
+471|         text = _WHITESPACE_RE.sub(" ", str(value)).strip()
+472|         return "" if text.lower() in ("", "nan", "none", "null") else text
+473| 
+474|     @staticmethod
+475|     def _short(exc: BaseException) -> str:
+476|         """Ringkas pesan exception agar log terminal tetap rapi."""
+477|         message = str(exc).strip() or exc.__class__.__name__
+478|         return _WHITESPACE_RE.sub(" ", message)[:160]
+479| 
+480|     @staticmethod
+481|     def _first_url(*values: Any) -> str:
+482|         """Ambil URL pertama yang masuk akal dari beberapa tag alternatif."""
+483|         for value in values:
+484|             text = BusinessDiscovery._clean(value)
+485|             if not text:
+486|                 continue
+487|             if text.startswith("//"):
+488|                 text = f"https:{text}"
+489|             if not re.match(r"^https?://", text, re.IGNORECASE):
+490|                 host = text.split("/")[0]
+491|                 if "." not in host or " " in text:
+492|                     continue
+493|                 text = f"https://{text.lstrip('/')}"
+494|             return text.rstrip("/")
+495|         return ""
+496| 
+497|     @staticmethod
+498|     def _first_email(*values: Any) -> str:
+499|         """Ambil email pertama yang valid (tag bisa berisi beberapa alamat)."""
+500|         for value in values:
+501|             text = BusinessDiscovery._clean(value)
+502|             if not text:
+503|                 continue
+504|             for chunk in re.split(r"[;,]", text):
+505|                 candidate = chunk.strip()
+506|                 if re.match(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$", candidate):
+507|                     return candidate.lower()
+508|         return ""
+509| 
+510|     @staticmethod
+511|     def _build_address(tags: Dict[str, Any]) -> str:
+512|         """Susun alamat dari tag addr:* (fallback ke tag alamat bebas)."""
+513|         street = " ".join(
+514|             part
+515|             for part in (
+516|                 BusinessDiscovery._clean(tags.get("addr:street")),
+517|                 BusinessDiscovery._clean(tags.get("addr:housenumber")),
+518|             )
+519|             if part
+520|         )
+521|         if not street:
+522|             street = BusinessDiscovery._clean(tags.get("address"))
+523| 
+524|         parts = [
+525|             street,
+526|             BusinessDiscovery._clean(tags.get("addr:suburb") or tags.get("addr:hamlet")),
+527|             BusinessDiscovery._clean(tags.get("addr:city") or tags.get("addr:town")),
+528|             BusinessDiscovery._clean(tags.get("addr:postcode")),
+529|         ]
+530|         return ", ".join(part for part in parts if part)
+531| 
+532|     @staticmethod
+533|     def _coordinates(element: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+534|         """Ambil koordinat dari node atau dari `center` (way/relation)."""
+535|         for source in (element, element.get("center") or {}):
+536|             lat = source.get("lat")
+537|             lon = source.get("lon")
+538|             if lat is None or lon is None:
+539|                 continue
+540|             try:
+541|                 return float(lat), float(lon)
+542|             except (TypeError, ValueError):
+543|                 continue
+544|         return None, None
+545| 
+546|     @staticmethod
+547|     def _is_inactive(tags: Dict[str, Any]) -> bool:
+548|         """True bila tag menandakan tempat sudah tutup/tidak dipakai."""
+549|         for key in _INACTIVE_KEYS:
+550|             value = str(tags.get(key, "")).strip().lower()
+551|             if value and (value in _INACTIVE_VALUES or value.startswith("disused")):
+552|                 return True
+553| 
+554|         lifecycle = str(tags.get("lifecycle") or "").strip().lower()
+555|         return lifecycle in _INACTIVE_VALUES
+556| 
+557|     # ------------------------------------------------------------------
+558|     # Tahap 4: anti-duplikat
+559|     # ------------------------------------------------------------------
+560|     @staticmethod
+561|     def _dedup(candidates: Iterable[BusinessCandidate]) -> Tuple[List[BusinessCandidate], int]:
+562|         """Buang duplikat (nama+kota sama, atau website sama).
+563| 
+564|         Return (kandidat_unik, jumlah_duplikat_dibuang). Kemunculan pertama
+565|         dipertahankan karena urutan hasil Overpass tidak dijamin.
+566|         """
+567|         unique: List[BusinessCandidate] = []
+568|         seen_identity: set = set()
+569|         seen_website: set = set()
+570|         removed = 0
+571| 
+572|         for candidate in candidates:
+573|             identity = candidate.identity
+574|             website = normalize_text(candidate.website)
+575|             has_website = candidate.website not in ("", "-")
+576| 
+577|             if identity in seen_identity or (has_website and website in seen_website):
+578|                 removed += 1
+579|                 continue
+580| 
+581|             seen_identity.add(identity)
+582|             if has_website:
+583|                 seen_website.add(website)
+584|             unique.append(candidate)
+585| 
+586|         return unique, removed
+587| 
+588|     # ------------------------------------------------------------------
+589|     # Tahap 5: orkestrasi
+590|     # ------------------------------------------------------------------
+591|     def find_businesses(
+592|         self,
+593|         filters: Iterable[str],
+594|         location: Location,
+595|         limit: int = 50,
+596|         fallback_category: Optional[str] = None,
+597|     ) -> Tuple[List[BusinessCandidate], int, int, str]:
+598|         """Jalankan Overpass untuk Location yang sudah di-geocode.
+599| 
+600|         Return (kandidat, jumlah_mentah, jumlah_tanpa_nama, url_mirror).
+601|         """
+602|         try:
+603|             query = self.build_overpass_query(filters, location, limit=limit)
+604|         except ValueError as exc:
+605|             self.last_errors.append(str(exc))
+606|             return [], 0, 0, ""
+607| 
+608|         payload, url = self._overpass_request(query)
+609|         if payload is None:
+610|             return [], 0, 0, ""
+611| 
+612|         elements = payload.get("elements") or []
+613|         candidates, skipped = self.to_candidates(
+614|             elements, location, fallback_category=fallback_category
+615|         )
+616|         return candidates, len(elements), skipped, url
+617| 
+618|     def discover(
+619|         self,
+620|         query_text: str,
+621|         limit: int = 50,
+622|         keyword: Optional[str] = None,
+623|         enrich_emails: bool = True,
+624|         scraper: Optional[WebsiteScraper] = None,
+625|     ) -> DiscoveryResult:
+626|         """Cari bisnis dari kalimat pencarian bebas.
+627| 
+628|         Args:
+629|             query_text: mis. "klinik jakarta selatan".
+630|             limit: jumlah maksimum baris yang dikembalikan.
+631|             keyword: paksa kategori tertentu (mengabaikan deteksi otomatis).
+632|             enrich_emails: lengkapi email via WebsiteScraper bila tag OSM kosong.
+633|             scraper: instance WebsiteScraper yang dipakai ulang (opsional).
+634| 
+635|         Return DiscoveryResult - tidak pernah melempar exception jaringan.
+636|         """
+637|         self.last_errors = []
+638|         self.last_overpass_url = ""
+639| 
+640|         raw_query = str(query_text or "").strip()
+641|         if not raw_query:
+642|             return DiscoveryResult(
+643|                 query=raw_query, errors=["Kata kunci pencarian kosong."]
+644|             )
+645| 
+646|         # 1) Pisahkan kategori + nama daerah.
+647|         if keyword:
+648|             category = build_category(keyword)
+649|             place = strip_keyword(raw_query, detect_keyword(raw_query) or category)
+650|         else:
+651|             category, place = parse_query(raw_query)
+652| 
+653|         # Kata kunci WAJIB dibuang sebelum geocode; kalau tidak, Nominatim
+654|         # mengembalikan POI (mis. "klinik jakarta selatan" -> klinik, bukan kota).
+655|         if not place:
+656|             place = raw_query
+657|         if category is None:
+658|             category = build_category(place)
+659| 
+660|         result = DiscoveryResult(query=raw_query, category=category)

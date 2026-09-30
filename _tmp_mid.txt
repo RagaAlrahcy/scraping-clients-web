@@ -1,0 +1,200 @@
+    manager2.website_exists("https://kliniksehatsentosa.co.id"),
+)
+check("website_exists False untuk domain baru", not manager2.website_exists("https://domain-baru.id"))
+check("website_exists False untuk '-'", not manager2.website_exists("-"))
+check(
+    "website_key samakan http/www/slash",
+    GoogleSheetsManager.website_key("http://www.KlinikSehatSentosa.co.id/")
+    == GoogleSheetsManager.website_key("https://kliniksehatsentosa.co.id"),
+)
+
+# Jalankan main() kedua kali: semua harus SKIP (tanpa duplikat baru)
+exit_code2 = main_module.main(
+    ["--urls", "https://kliniksehatsentosa.co.id", "https://warungtest.id"]
+)
+check("main() kedua kali exit 0 (semua SKIP)", exit_code2 == 0, exit_code2)
+check(
+    "tidak ada baris baru saat re-run",
+    len(SPREADSHEET.sheets[config.WORKSHEET_NAME].grid) == 4,
+    len(SPREADSHEET.sheets[config.WORKSHEET_NAME].grid),
+)
+
+# Google Sheets error saat insert -> program tetap selesai tanpa crash
+_original_append = GoogleSheetsManager.append_row
+
+
+def failing_append(self, data):
+    raise sm.SheetsError("simulasi quota exceeded")
+
+
+# Domain baru agar benar-benar masuk jalur INSERT (bukan SKIP).
+FETCH_MAP["https://domain-baru.id"] = HTML_MINIMAL
+GoogleSheetsManager.append_row = failing_append
+exit_code3 = main_module.main(["--urls", "https://domain-baru.id"])
+check("main() tetap selesai walau Sheets error (exit 1)", exit_code3 == 1, exit_code3)
+check(
+    "Sheets error tidak menambah baris",
+    len(SPREADSHEET.sheets[config.WORKSHEET_NAME].grid) == 4,
+    len(SPREADSHEET.sheets[config.WORKSHEET_NAME].grid),
+)
+GoogleSheetsManager.append_row = _original_append
+
+# URL list kosong -> argparse menolak (--urls butuh minimal satu URL)
+try:
+    main_module.parse_args(["--urls"])
+    check("argparse menolak --urls tanpa URL", False)
+except SystemExit:
+    check("argparse menolak --urls tanpa URL", True)
+
+# ---------------------------------------------------------------------------
+# 6. Discovery OSM (offline): kategori -> query Overpass -> kandidat bisnis
+# ---------------------------------------------------------------------------
+from discovery import (  # noqa: E402
+    BusinessCandidate,
+    BusinessDiscovery,
+    DiscoveryResult,
+    Location,
+    available_keywords,
+    build_category,
+    category_from_tags,
+    detect_keyword,
+    filter_matches_tags,
+    name_filter,
+    normalize_text,
+    parse_query,
+    title_case_place,
+)
+from discovery import osm_discovery as od  # noqa: E402
+
+check("discovery importable", callable(BusinessDiscovery.discover))
+
+match, place = parse_query("klinik di jakarta selatan")
+check(
+    "parse_query mendeteksi kategori 'klinik'",
+    match is not None and match.category == "Klinik",
+    match,
+)
+check("parse_query menyisakan nama daerah", place == "jakarta selatan", place)
+check(
+    "parse_query memakai frasa terpanjang ('klinik gigi')",
+    parse_query("klinik gigi jakarta selatan")[0].category == "Dokter Gigi",
+    parse_query("klinik gigi jakarta selatan")[0],
+)
+check("detect_keyword None tanpa kategori", detect_keyword("xyz abc") is None)
+check(
+    "detect_keyword 'rumah sakit' menang atas 'rumah'",
+    detect_keyword("rumah sakit bandung").category == "Rumah Sakit",
+    detect_keyword("rumah sakit bandung"),
+)
+check("build_category('apotek')", build_category("apotek").category == "Apotek")
+check(
+    "build_category kata kunci asing -> fallback nama",
+    build_category("kedai kopi").fallback_name is True,
+    build_category("kedai kopi"),
+)
+check(
+    "name_filter case-insensitive",
+    name_filter("Kedai Kopi") == '["name"~"kedai kopi",i]',
+    name_filter("Kedai Kopi"),
+)
+check(
+    "normalize_text membersihkan tanda baca",
+    normalize_text("Klinik Sehat, Jl.!") == "klinik sehat jl",
+    normalize_text("Klinik Sehat, Jl.!"),
+)
+check(
+    "title_case_place",
+    title_case_place("jakarta selatan") == "Jakarta Selatan",
+    title_case_place("jakarta selatan"),
+)
+check("available_keywords berisi 'klinik'", "klinik" in available_keywords())
+
+# --- filter Overpass -> tag OSM (AND di dalam satu filter, OR antar filter) ---
+check(
+    "filter_matches_tags cocok (amenity=pharmacy)",
+    filter_matches_tags('["amenity"="pharmacy"]', {"amenity": "pharmacy"}),
+)
+check(
+    "filter_matches_tags menolak tag berbeda",
+    not filter_matches_tags('["amenity"="pharmacy"]', {"amenity": "clinic"}),
+)
+check(
+    "filter_matches_tags mendukung regex '^(a|b)$'",
+    filter_matches_tags('["amenity"~"^(clinic|doctors)$"]', {"amenity": "doctors"}),
+)
+check(
+    "filter_matches_tags AND antar kondisi",
+    filter_matches_tags(
+        '["amenity"="place_of_worship"]["religion"="muslim"]',
+        {"amenity": "place_of_worship", "religion": "muslim"},
+    )
+    and not filter_matches_tags(
+        '["amenity"="place_of_worship"]["religion"="muslim"]',
+        {"amenity": "place_of_worship", "religion": "christian"},
+    ),
+)
+check("filter_matches_tags tanpa tag -> False", not filter_matches_tags('["amenity"]', {}))
+
+check(
+    "category_from_tags(amenity=pharmacy) -> Apotek",
+    category_from_tags({"amenity": "pharmacy"}) == "Apotek",
+    category_from_tags({"amenity": "pharmacy"}),
+)
+check(
+    "category_from_tags(amenity=dentist) -> Dokter Gigi",
+    category_from_tags({"amenity": "dentist"}) == "Dokter Gigi",
+    category_from_tags({"amenity": "dentist"}),
+)
+check(
+    "category_from_tags(healthcare=clinic) -> Klinik",
+    category_from_tags({"healthcare": "clinic"}) == "Klinik",
+    category_from_tags({"healthcare": "clinic"}),
+)
+check("category_from_tags tag asing -> None", category_from_tags({"shop": "car"}) is None)
+
+# --- Location + penyusunan query Overpass ---
+location = Location(
+    query="jakarta selatan",
+    display_name="Jakarta Selatan, DKI Jakarta, Indonesia",
+    osm_type="relation",
+    osm_id=7647556,
+    boundingbox=(-6.4, -6.1, 106.6, 106.9),
+    city="Jakarta Selatan",
+    addresstype="city_district",
+    place_type="administrative",
+)
+check("Location.area_id = 3600000000 + osm_id", location.area_id == 3607647556, location.area_id)
+check("Location.bbox format Overpass", location.bbox == "-6.4,106.6,-6.1,106.9", location.bbox)
+check("Location.label", location.label.startswith("Jakarta Selatan"), location.label)
+
+query_text = BusinessDiscovery.build_overpass_query(
+    build_category("klinik").filters, location, limit=15
+)
+check("query Overpass diawali header [out:json]", query_text.startswith("[out:json][timeout="), query_text[:40])
+check("query Overpass memakai area relation", "area(3607647556)->.a;" in query_text, query_text)
+check("query Overpass memakai scope area.a", "(area.a)" in query_text, query_text)
+check("query Overpass menutup dengan 'out center tags 15;'", query_text.endswith("out center tags 15;"), query_text[-30:])
+
+bbox_location = Location(
+    query="bandung",
+    display_name="Bandung",
+    osm_type="node",
+    osm_id=123,
+    boundingbox=(-6.95, -6.85, 107.55, 107.7),
+    city="Bandung",
+)
+bbox_query = BusinessDiscovery.build_overpass_query(['["amenity"="cafe"]'], bbox_location)
+check("query Overpass fallback bbox bila bukan relation", "(-6.95,107.55,-6.85,107.7)" in bbox_query, bbox_query)
+check("bbox_location.area_id None", bbox_location.area_id is None)
+
+try:
+    BusinessDiscovery.build_overpass_query([], location)
+    check("build_overpass_query menolak filter kosong", False)
+except ValueError:
+    check("build_overpass_query menolak filter kosong", True)
+
+try:
+    BusinessDiscovery.build_overpass_query(['["amenity"="cafe"]'], None)
+    check("build_overpass_query menolak location kosong", False)
+except ValueError:
+    check("build_overpass_query menolak location kosong", True)

@@ -1,0 +1,318 @@
+"""Pemetaan kata kunci bahasa Indonesia -> tag OpenStreetMap.
+
+Modul ini murni data + fungsi kecil (tanpa jaringan), sehingga bisa diuji
+sepenuhnya offline. Dipakai oleh discovery/osm_discovery.py untuk menyusun
+query Overpass dari kalimat seperti "klinik jakarta selatan".
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Peta kata kunci -> (label kategori, daftar filter Overpass)
+#
+# Satu string filter = SATU pernyataan `nwr` (semua atribut di dalamnya
+# bersifat AND). Beberapa filter dalam satu kategori digabung secara OR.
+# ---------------------------------------------------------------------------
+KEYWORD_MAP: Dict[str, Tuple[str, Tuple[str, ...]]] = {
+    # Kesehatan
+    "klinik gigi": ("Dokter Gigi", ('["amenity"="dentist"]', '["healthcare"="dentist"]')),
+    "dokter gigi": ("Dokter Gigi", ('["amenity"="dentist"]', '["healthcare"="dentist"]')),
+    "rumah sakit": ("Rumah Sakit", ('["amenity"="hospital"]',)),
+    "puskesmas": ("Puskesmas", ('["name"~"puskesmas",i]', '["amenity"="clinic"]["operator:type"="government"]')),
+    "klinik": ("Klinik", ('["amenity"~"^(clinic|doctors)$"]', '["healthcare"~"^(clinic|centre|doctor)$"]')),
+    "dokter": ("Dokter", ('["amenity"="doctors"]', '["healthcare"="doctor"]')),
+    "apotek": ("Apotek", ('["amenity"="pharmacy"]', '["healthcare"="pharmacy"]')),
+    "laboratorium": ("Laboratorium", ('["amenity"="laboratory"]', '["healthcare"="laboratory"]')),
+    "bidan": ("Bidan", ('["healthcare"="midwife"]',)),
+    "optik": ("Optik", ('["shop"="optician"]',)),
+    "fisioterapi": ("Fisioterapi", ('["healthcare"="physiotherapist"]',)),
+    # Kuliner
+    "rumah makan": ("Restoran", ('["amenity"~"^(restaurant|fast_food)$"]',)),
+    "restoran": ("Restoran", ('["amenity"~"^(restaurant|fast_food)$"]',)),
+    "kafe": ("Kafe", ('["amenity"="cafe"]',)),
+    "coffee shop": ("Kafe", ('["amenity"="cafe"]',)),
+    "bakery": ("Toko Roti", ('["shop"="bakery"]',)),
+    "warung": ("Warung", ('["shop"="convenience"]', '["amenity"="fast_food"]')),
+    "katering": ("Katering", ('["shop"="caterer"]', '["craft"="caterer"]')),
+    # Retail
+    "minimarket": ("Minimarket", ('["shop"~"^(supermarket|convenience)$"]',)),
+    "supermarket": ("Supermarket", ('["shop"="supermarket"]',)),
+    "toko bangunan": ("Toko Bangunan", ('["shop"="doityourself"]', '["shop"="hardware"]')),
+    "toko elektronik": ("Toko Elektronik", ('["shop"="electronics"]',)),
+    "furnitur": ("Furnitur", ('["shop"="furniture"]',)),
+    "butik": ("Butik", ('["shop"~"^(clothes|boutique)$"]',)),
+    "toko sepatu": ("Toko Sepatu", ('["shop"="shoes"]',)),
+    "apartemen": ("Apartemen", ('["building"="apartments"]', '["tourism"="apartment"]')),
+    "properti": ("Properti", ('["office"="estate_agent"]',)),
+    # Jasa
+    "salon": ("Salon", ('["shop"~"^(hairdresser|beauty)$"]',)),
+    "barbershop": ("Barbershop", ('["shop"="hairdresser"]',)),
+    "spa": ("Spa", ('["leisure"="spa"]', '["shop"="massage"]')),
+    "gym": ("Gym", ('["leisure"="fitness_centre"]',)),
+    "fitness": ("Gym", ('["leisure"="fitness_centre"]',)),
+    "laundry": ("Laundry", ('["shop"="laundry"]',)),
+    "percetakan": ("Percetakan", ('["shop"="copyshop"]', '["craft"="printer"]')),
+    "fotokopi": ("Fotokopi", ('["shop"="copyshop"]',)),
+    "bengkel": ("Bengkel", ('["shop"~"^(car_repair|motorcycle_repair)$"]',)),
+    "cuci mobil": ("Cuci Mobil", ('["amenity"="car_wash"]',)),
+    "travel": ("Travel", ('["shop"="travel_agency"]',)),
+    "notaris": ("Notaris", ('["office"="notary"]',)),
+    "pengacara": ("Pengacara", ('["office"="lawyer"]',)),
+    "asuransi": ("Asuransi", ('["office"="insurance"]',)),
+    "kantor": ("Kantor", ('["office"]',)),
+    # Pendidikan
+    "taman kanak-kanak": ("TK/PAUD", ('["amenity"="kindergarten"]',)),
+    "sekolah": ("Sekolah", ('["amenity"="school"]',)),
+    "kampus": ("Kampus", ('["amenity"~"^(university|college)$"]',)),
+    "universitas": ("Kampus", ('["amenity"~"^(university|college)$"]',)),
+    "kursus": ("Kursus", ('["amenity"="training"]', '["office"="educational_institution"]')),
+    # Umum / lain-lain
+    "bank": ("Bank", ('["amenity"="bank"]',)),
+    "atm": ("ATM", ('["amenity"="atm"]',)),
+    "hotel": ("Hotel", ('["tourism"="hotel"]',)),
+    "penginapan": ("Penginapan", ('["tourism"~"^(guest_house|hostel|motel)$"]',)),
+    "pabrik": ("Pabrik", ('["man_made"="works"]',)),
+    "gudang": ("Gudang", ('["building"="warehouse"]',)),
+    "masjid": ("Masjid", ('["amenity"="place_of_worship"]["religion"="muslim"]',)),
+    "gereja": ("Gereja", ('["amenity"="place_of_worship"]["religion"="christian"]',)),
+}
+
+# Kata penghubung yang dibuang saat memisahkan nama daerah dari kalimat.
+_PLACE_STOPWORDS = (
+    "di",
+    "daerah",
+    "kawasan",
+    "area",
+    "wilayah",
+    "sekitar",
+    "sekitaran",
+    "dekat",
+    "dari",
+)
+
+# Urutan pencocokan: frasa terpanjang lebih dulu supaya "klinik gigi"
+# menang atas "klinik", dan "rumah sakit" menang atas "rumah".
+_KEYWORD_ORDER: Tuple[str, ...] = tuple(
+    sorted(KEYWORD_MAP, key=lambda keyword: (-len(keyword), keyword))
+)
+
+
+@dataclass(frozen=True)
+class CategoryMatch:
+    """Hasil pencocokan kata kunci kategori.
+
+    Attributes:
+        keyword: kata kunci yang dikenali (mis. "klinik").
+        category: label kategori untuk kolom Google Sheets (mis. "Klinik").
+        filters: daftar filter Overpass (OR antar filter).
+        fallback_name: True bila kata kunci tidak dikenal, sehingga pencarian
+            dilakukan lewat kecocokan nama (name~"...").
+    """
+
+    keyword: str
+    category: str
+    filters: Tuple[str, ...]
+    fallback_name: bool = False
+
+
+def available_keywords() -> List[str]:
+    """Daftar kata kunci kategori yang dikenali (untuk --list-keywords)."""
+    return sorted(KEYWORD_MAP)
+
+
+def build_category(keyword: str) -> CategoryMatch:
+    """Buat CategoryMatch dari kata kunci.
+
+    Kata kunci yang tidak ada di KEYWORD_MAP tetap didukung: pencarian
+    dilakukan dengan filter nama (name~"kata kunci").
+    """
+    key = normalize_text(keyword)
+    if not key:
+        raise ValueError("Kata kunci kategori tidak boleh kosong.")
+
+    if key in KEYWORD_MAP:
+        label, filters = KEYWORD_MAP[key]
+        return CategoryMatch(keyword=key, category=label, filters=filters)
+
+    return CategoryMatch(
+        keyword=key,
+        category=key.title(),
+        filters=(name_filter(key),),
+        fallback_name=True,
+    )
+
+
+def detect_keyword(text: str) -> Optional[CategoryMatch]:
+    """Cari kategori yang paling cocok di dalam kalimat bebas.
+
+    Contoh: "klinik gigi di jakarta selatan" -> kategori "Dokter Gigi".
+    Return None bila tidak ada kata kunci yang dikenali.
+    """
+    haystack = normalize_text(text)
+    if not haystack:
+        return None
+
+    for keyword in _KEYWORD_ORDER:
+        pattern = r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])"
+        if re.search(pattern, haystack):
+            return build_category(keyword)
+
+    return None
+
+
+def strip_keyword(text: str, match: Optional[CategoryMatch]) -> str:
+    """Buang kata kunci kategori + kata penghubung, sisakan nama daerah."""
+    haystack = normalize_text(text)
+    if not haystack:
+        return ""
+
+    if match is not None:
+        haystack = re.sub(
+            r"(?<![a-z0-9])" + re.escape(match.keyword) + r"(?![a-z0-9])",
+            " ",
+            haystack,
+        )
+
+    tokens = [token for token in haystack.split() if token]
+    meaningful = [token for token in tokens if token not in _PLACE_STOPWORDS]
+    # Bila semua token adalah kata penghubung, pakai token apa adanya.
+    chosen = meaningful or tokens
+    return " ".join(chosen).strip(" ,;.-")
+
+
+def parse_query(text: str) -> Tuple[Optional[CategoryMatch], str]:
+    """Pisahkan kalimat pencarian menjadi (kategori, nama daerah).
+
+    >>> parse_query("klinik di jakarta selatan")[1]
+    'jakarta selatan'
+    """
+    if text is None or not str(text).strip():
+        return None, ""
+
+    raw = str(text).strip()
+    match = detect_keyword(raw)
+    place = strip_keyword(raw, match)
+
+    if match is None:
+        # Tanpa kategori yang dikenali: seluruh kalimat dianggap nama daerah,
+        # dan pencarian bisnis memakai filter nama.
+        return None, place
+
+    return match, place
+
+
+def name_filter(text: str) -> str:
+    """Filter Overpass berbasis nama (case-insensitive)."""
+    cleaned = normalize_text(text).replace("\\", "").replace('"', "")
+    return '["name"~"%s",i]' % cleaned
+
+
+# ---------------------------------------------------------------------------
+# Deteksi kategori dari tag OSM (kebalikan dari KEYWORD_MAP)
+# ---------------------------------------------------------------------------
+# Contoh filter yang dipahami: ["amenity"="clinic"], ["shop"~"^(a|b)$"],
+# ["office"], ["amenity"="place_of_worship"]["religion"="muslim"].
+_FILTER_TOKEN_RE = re.compile(
+    r'\[\s*"(?P<key>[^"]+)"\s*(?:(?P<op>=|~)\s*"(?P<value>[^"]*)"\s*'
+    r'(?:,\s*(?P<flags>[a-z]+)\s*)?)?\]'
+)
+
+
+def _parse_filter(filter_text: str) -> List[Tuple[str, Optional[str], str, str]]:
+    """Ubah string filter Overpass menjadi daftar kondisi tag.
+
+    Return list of (key, operator, value, flags). operator None = "ada tag".
+    """
+    conditions: List[Tuple[str, Optional[str], str, str]] = []
+    for match in _FILTER_TOKEN_RE.finditer(str(filter_text)):
+        conditions.append(
+            (
+                match.group("key"),
+                match.group("op"),
+                match.group("value") or "",
+                match.group("flags") or "",
+            )
+        )
+    return conditions
+
+
+def _condition_matches(tags: Dict[str, str], condition: Tuple[str, Optional[str], str, str]) -> bool:
+    """True bila satu kondisi filter terpenuhi oleh tag elemen OSM."""
+    key, operator, value, flags = condition
+    if key not in tags:
+        return False
+
+    if operator is None:  # hanya butuh keberadaan tag
+        return True
+
+    actual = str(tags.get(key, ""))
+    if operator == "=":
+        return actual == value
+
+    # operator "~" -> regex; hormati flag 'i' (case-insensitive).
+    pattern = value
+    if not flags:
+        pattern = f"^(?:{pattern})$"
+    try:
+        if "i" in flags:
+            return re.search(pattern, actual, re.IGNORECASE) is not None
+        return re.search(pattern, actual) is not None
+    except re.error:
+        return False
+
+
+def filter_matches_tags(filter_text: str, tags: Dict[str, str]) -> bool:
+    """True bila seluruh kondisi dalam satu filter terpenuhi (AND)."""
+    if not tags:
+        return False
+
+    conditions = _parse_filter(filter_text)
+    if not conditions:
+        return False
+
+    return all(_condition_matches(tags, condition) for condition in conditions)
+
+
+def category_from_tags(tags: Dict[str, str]) -> Optional[str]:
+    """Tentukan label kategori dari tag OSM sebuah elemen.
+
+    Dipakai untuk memastikan kolom Kategori tetap benar walau hasil Overpass
+    datang dari filter gabungan. Return None bila tidak ada yang cocok.
+    """
+    if not tags:
+        return None
+
+    for keyword in _KEYWORD_ORDER:
+        label, filters = KEYWORD_MAP[keyword]
+        for filter_text in filters:
+            # Filter berbasis nama bukan penanda kategori yang andal.
+            if '"name"' in filter_text:
+                continue
+            if filter_matches_tags(filter_text, tags):
+                return label
+
+    return None
+
+
+
+def normalize_text(text: str) -> str:
+    """Huruf kecil, tanpa tanda baca berlebih, spasi tunggal."""
+    if text is None:
+        return ""
+    lowered = str(text).lower().replace("\u2013", " ").replace("\u2014", " ")
+    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def title_case_place(place: str) -> str:
+    """Rapikan nama daerah untuk kolom Kota ("jakarta selatan" -> "Jakarta Selatan")."""
+    cleaned = re.sub(r"\s+", " ", str(place or "")).strip()
+    if not cleaned:
+        return ""
+    return " ".join(
+        word.capitalize() if len(word) > 2 else word.upper() for word in cleaned.split()
+    )

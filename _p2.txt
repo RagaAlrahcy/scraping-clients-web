@@ -1,0 +1,201 @@
+        try:
+            osm_id = int(item.get("osm_id") or 0)
+        except (TypeError, ValueError):
+            osm_id = 0
+
+        return Location(
+            query=query,
+            display_name=str(item.get("display_name") or ""),
+            osm_type=str(item.get("osm_type") or ""),
+            osm_id=osm_id,
+            boundingbox=(south, north, west, east),
+            city=title_case_place(str(city)),
+            addresstype=str(item.get("addresstype") or ""),
+            place_type=str(item.get("type") or ""),
+        )
+
+    # ------------------------------------------------------------------
+    # Tahap 2: susun + kirim query Overpass
+    # ------------------------------------------------------------------
+    @staticmethod
+    def build_overpass_query(
+        filters: Iterable[str],
+        location: Location,
+        limit: int = 50,
+        timeout: int = OVERPASS_TIMEOUT,
+    ) -> str:
+        """Susun QL Overpass dari filter + Location.
+
+        Bila geocode berupa relation administratif, pencarian dibatasi dengan
+        ``area(3600000000 + osm_id)->.a``; bila tidak, dipakai bounding box.
+        ``out center tags`` mengambil tag lengkap tanpa geometri (respons ringan).
+
+        Raise ValueError bila location kosong (query global terlalu berat).
+        """
+        if location is None:
+            raise ValueError("Location wajib diisi untuk menyusun query Overpass.")
+
+        valid = [str(item).strip() for item in filters if str(item or "").strip()]
+        if not valid:
+            raise ValueError("Minimal satu filter Overpass harus diberikan.")
+
+        header = f"[out:json][timeout={int(timeout)}];"
+        area_id = location.area_id
+        if area_id is not None:
+            header += f"area({area_id})->.a;"
+            scope = "(area.a)"
+        else:
+            scope = f"({location.bbox})"
+
+        statements = "".join(f"nwr{filter_text}{scope};" for filter_text in valid)
+        return f"{header}({statements});out center tags {int(limit)};"
+
+    def _overpass_request(self, query: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Kirim query ke mirror Overpass berurutan. Return (payload, url)."""
+        last_error = ""
+
+        for index, url in enumerate(self.overpass_urls):
+            try:
+                response = self.session.post(
+                    url, data={"data": query}, timeout=self.timeout
+                )
+            except requests.exceptions.Timeout:
+                last_error = f"timeout setelah {self.timeout} detik di {url}"
+                self._backoff(index)
+                continue
+            except requests.exceptions.RequestException as exc:
+                last_error = f"{url} -> {self._short(exc)}"
+                self._backoff(index)
+                continue
+
+            if response.status_code in _RETRYABLE_STATUS:
+                last_error = f"{url} -> HTTP {response.status_code} (dibatasi/ditolak)"
+                self._backoff(index)
+                continue
+
+            if response.status_code != 200:
+                last_error = f"{url} -> HTTP {response.status_code}"
+                continue
+
+            try:
+                payload = response.json()
+            except ValueError:
+                last_error = f"{url} -> respons bukan JSON"
+                self._backoff(index)
+                continue
+
+            if "elements" not in payload:
+                remark = str(payload.get("remark") or "").strip()
+                last_error = f"{url} -> respons tanpa 'elements' {remark}".strip()
+                self._backoff(index)
+                continue
+
+            return payload, url
+
+        if last_error:
+            self.last_errors.append(f"Overpass gagal: {last_error}")
+        return None, ""
+
+    def _backoff(self, index: int) -> None:
+        """Jeda sopan sebelum mencoba mirror berikutnya."""
+        if index < len(RETRY_BACKOFF):
+            time.sleep(RETRY_BACKOFF[index])
+
+    # ------------------------------------------------------------------
+    # Tahap 3: konversi elemen OSM -> BusinessCandidate
+    # ------------------------------------------------------------------
+    def to_candidates(
+        self,
+        elements: Iterable[Dict[str, Any]],
+        location: Location,
+        fallback_category: Optional[str] = None,
+    ) -> Tuple[List[BusinessCandidate], int]:
+        """Ubah elemen OSM menjadi kandidat bisnis.
+
+        Return (kandidat, jumlah elemen yang dibuang karena tanpa nama).
+        """
+        candidates: List[BusinessCandidate] = []
+        skipped = 0
+
+        for element in elements:
+            tags = element.get("tags") or {}
+            if not isinstance(tags, dict) or not tags:
+                continue
+
+            name = self._clean(
+                tags.get("name") or tags.get("name:id") or tags.get("operator")
+            )
+            if not name:
+                skipped += 1
+                continue
+
+            if self._is_inactive(tags):
+                continue
+
+            website = self._first_url(
+                tags.get("website"),
+                tags.get("contact:website"),
+                tags.get("url"),
+            )
+            email = self._first_email(tags.get("email"), tags.get("contact:email"))
+            phone = self._clean(
+                tags.get("phone")
+                or tags.get("contact:phone")
+                or tags.get("contact:mobile")
+            )
+            lat, lon = self._coordinates(element)
+
+            candidates.append(
+                BusinessCandidate(
+                    name=name,
+                    category=category_from_tags(tags) or fallback_category or "-",
+                    city=location.city or "-",
+                    website=website or "-",
+                    email=email or "-",
+                    phone=phone or "-",
+                    address=self._build_address(tags) or "-",
+                    status="-",
+                    osm_type=str(element.get("type") or ""),
+                    osm_id=int(element.get("id") or 0),
+                    lat=lat,
+                    lon=lon,
+                )
+            )
+
+        return candidates, skipped
+
+    @staticmethod
+    def _clean(value: Any) -> str:
+        """Rapikan nilai tag OSM (buang spasi/tanda pisah berlebih)."""
+        if value is None:
+            return ""
+        text = _WHITESPACE_RE.sub(" ", str(value)).strip()
+        return "" if text.lower() in ("", "nan", "none", "null") else text
+
+    @staticmethod
+    def _short(exc: BaseException) -> str:
+        """Ringkas pesan exception agar log terminal tetap rapi."""
+        message = str(exc).strip() or exc.__class__.__name__
+        return _WHITESPACE_RE.sub(" ", message)[:160]
+
+    @staticmethod
+    def _first_url(*values: Any) -> str:
+        """Ambil URL pertama yang masuk akal dari beberapa tag alternatif."""
+        for value in values:
+            text = BusinessDiscovery._clean(value)
+            if not text:
+                continue
+            if text.startswith("//"):
+                text = f"https:{text}"
+            if not re.match(r"^https?://", text, re.IGNORECASE):
+                host = text.split("/")[0]
+                if "." not in host or " " in text:
+                    continue
+                text = f"https://{text.lstrip('/')}"
+            return text.rstrip("/")
+        return ""
+
+    @staticmethod
+    def _first_email(*values: Any) -> str:
+        """Ambil email pertama yang valid (tag bisa berisi beberapa alamat)."""
+        for value in values:

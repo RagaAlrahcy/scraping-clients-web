@@ -1,0 +1,50 @@
+232|     def geocode_place(self, place: str) -> Optional[Location]:
+233|         """Ubah nama daerah menjadi Location (bbox + area id).
+234| 
+235|         Return None bila daerah tidak ditemukan atau request gagal.
+236|         """
+237|         cleaned = _WHITESPACE_RE.sub(" ", str(place or "")).strip()
+238|         if not cleaned:
+239|             return None
+240| 
+241|         params = {
+242|             "q": cleaned,
+243|             "format": "jsonv2",
+244|             "limit": 1,
+245|             "addressdetails": 1,
+246|         }
+247| 
+248|         try:
+249|             response = self.session.get(
+250|                 self.nominatim_url, params=params, timeout=NOMINATIM_TIMEOUT
+251|             )
+252|         except requests.exceptions.RequestException as exc:
+253|             self.last_errors.append(f"Nominatim gagal dihubungi: {self._short(exc)}")
+254|             return None
+255| 
+256|         if response.status_code != 200:
+257|             self.last_errors.append(
+258|                 f"Nominatim HTTP {response.status_code} untuk daerah '{cleaned}'."
+259|             )
+260|             return None
+261| 
+262|         try:
+263|             payload = response.json()
+264|         except ValueError:
+265|             self.last_errors.append("Respons Nominatim bukan JSON yang valid.")
+266|             return None
+267| 
+268|         if not isinstance(payload, list) or not payload:
+269|             self.last_errors.append(
+270|                 f"Daerah '{cleaned}' tidak ditemukan di OpenStreetMap."
+271|             )
+272|             return None
+273| 
+274|         location = self._location_from_payload(payload[0], cleaned)
+275|         if location is None:
+276|             self.last_errors.append(
+277|                 f"Daerah '{cleaned}' tidak punya bounding box yang bisa dipakai."
+278|             )
+279|         return location
+280| 
+281|     @staticmethod

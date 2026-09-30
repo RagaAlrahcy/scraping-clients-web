@@ -1,0 +1,165 @@
+﻿    def to_candidates(
+        self,
+        elements: Iterable[Dict[str, Any]],
+        location: Location,
+        fallback_category: Optional[str] = None,
+    ) -> Tuple[List[BusinessCandidate], int]:
+        """Ubah elemen OSM menjadi kandidat bisnis.
+
+        Return (kandidat, jumlah elemen yang dibuang karena tanpa nama).
+        """
+        candidates: List[BusinessCandidate] = []
+        skipped = 0
+
+        for element in elements:
+            tags = element.get("tags") or {}
+            if not isinstance(tags, dict) or not tags:
+                continue
+
+            name = self._clean(
+                tags.get("name") or tags.get("name:id") or tags.get("operator")
+            )
+            if not name:
+                skipped += 1
+                continue
+
+            if self._is_inactive(tags):
+                continue
+
+            website = self._first_url(
+                tags.get("website"),
+                tags.get("contact:website"),
+                tags.get("url"),
+            )
+            email = self._first_email(tags.get("email"), tags.get("contact:email"))
+            phone = self._clean(
+                tags.get("phone")
+                or tags.get("contact:phone")
+                or tags.get("contact:mobile")
+            )
+            lat, lon = self._coordinates(element)
+
+            candidates.append(
+                BusinessCandidate(
+                    name=name,
+                    category=category_from_tags(tags) or fallback_category or "-",
+                    city=location.city or "-",
+                    website=website or "-",
+                    email=email or "-",
+                    phone=phone or "-",
+                    address=self._build_address(tags) or "-",
+                    status="-",
+                    osm_type=str(element.get("type") or ""),
+                    osm_id=int(element.get("id") or 0),
+                    lat=lat,
+                    lon=lon,
+                )
+            )
+
+        return candidates, skipped
+
+    @staticmethod
+    def _clean(value: Any) -> str:
+        """Rapikan nilai tag OSM (buang spasi/tanda pisah berlebih)."""
+        if value is None:
+            return ""
+        text = _WHITESPACE_RE.sub(" ", str(value)).strip()
+        return "" if text.lower() in ("", "nan", "none", "null") else text
+
+    @staticmethod
+    def _short(exc: BaseException) -> str:
+        """Ringkas pesan exception agar log terminal tetap rapi."""
+        message = str(exc).strip() or exc.__class__.__name__
+        return _WHITESPACE_RE.sub(" ", message)[:160]
+
+    @staticmethod
+    def _first_url(*values: Any) -> str:
+        """Ambil URL pertama yang masuk akal dari beberapa tag alternatif."""
+        for value in values:
+            text = BusinessDiscovery._clean(value)
+            if not text:
+                continue
+            if text.startswith("//"):
+                text = f"https:{text}"
+            if not re.match(r"^https?://", text, re.IGNORECASE):
+                host = text.split("/")[0]
+                if "." not in host or " " in text:
+                    continue
+                text = f"https://{text.lstrip('/')}"
+            return text.rstrip("/")
+        return ""
+
+    @staticmethod
+    def _first_email(*values: Any) -> str:
+        """Ambil email pertama yang valid (tag bisa berisi beberapa alamat)."""
+        for value in values:
+            text = BusinessDiscovery._clean(value)
+            if not text:
+                continue
+            for chunk in re.split(r"[;,]", text):
+                candidate = chunk.strip()
+                if re.match(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$", candidate):
+                    return candidate.lower()
+        return ""
+
+    @staticmethod
+    def _build_address(tags: Dict[str, Any]) -> str:
+        """Susun alamat dari tag addr:* (fallback ke tag alamat bebas)."""
+        street = " ".join(
+            part
+            for part in (
+                BusinessDiscovery._clean(tags.get("addr:street")),
+                BusinessDiscovery._clean(tags.get("addr:housenumber")),
+            )
+            if part
+        )
+        if not street:
+            street = BusinessDiscovery._clean(tags.get("address"))
+
+        parts = [
+            street,
+            BusinessDiscovery._clean(tags.get("addr:suburb") or tags.get("addr:hamlet")),
+            BusinessDiscovery._clean(tags.get("addr:city") or tags.get("addr:town")),
+            BusinessDiscovery._clean(tags.get("addr:postcode")),
+        ]
+        return ", ".join(part for part in parts if part)
+
+    @staticmethod
+    def _coordinates(element: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+        """Ambil koordinat dari node atau dari `center` (way/relation)."""
+        for source in (element, element.get("center") or {}):
+            lat = source.get("lat")
+            lon = source.get("lon")
+            if lat is None or lon is None:
+                continue
+            try:
+                return float(lat), float(lon)
+            except (TypeError, ValueError):
+                continue
+        return None, None
+
+    @staticmethod
+    def _is_inactive(tags: Dict[str, Any]) -> bool:
+        """True bila tag menandakan tempat sudah tutup/tidak dipakai."""
+        for key in _INACTIVE_KEYS:
+            value = str(tags.get(key, "")).strip().lower()
+            if value and (value in _INACTIVE_VALUES or value.startswith("disused")):
+                return True
+
+        lifecycle = str(tags.get("lifecycle") or "").strip().lower()
+        return lifecycle in _INACTIVE_VALUES
+
+    # ------------------------------------------------------------------
+    # Tahap 4: anti-duplikat
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _dedup(candidates: Iterable[BusinessCandidate]) -> Tuple[List[BusinessCandidate], int]:
+        """Buang duplikat (nama+kota sama, atau website sama).
+
+        Return (kandidat_unik, jumlah_duplikat_dibuang). Kemunculan pertama
+        dipertahankan karena urutan hasil Overpass tidak dijamin.
+        """
+        unique: List[BusinessCandidate] = []
+        seen_identity: set = set()
+        seen_website: set = set()
+        removed = 0

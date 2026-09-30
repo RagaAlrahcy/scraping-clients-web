@@ -1,0 +1,759 @@
+"""Simulasi lokal: uji alur GoogleSheetsManager + main.py dengan gspread tiruan.
+
+File ini hanya untuk validasi offline (tidak memanggil Google API).
+Jalankan: python selfcheck_offline.py
+"""
+
+import json
+import sys
+import types
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 1. Bangun modul gspread tiruan sebelum import sheets_manager
+# ---------------------------------------------------------------------------
+fake_gspread = types.ModuleType("gspread")
+fake_auth = types.ModuleType("google.auth")
+fake_auth_exc = types.ModuleType("google.auth.exceptions")
+fake_sa = types.ModuleType("google.oauth2.service_account")
+
+
+class FakeAPIError(Exception):
+    pass
+
+
+class FakeSpreadsheetNotFound(Exception):
+    pass
+
+
+class FakeWorksheetNotFound(Exception):
+    pass
+
+
+fake_gspread_exceptions = types.ModuleType("gspread.exceptions")
+fake_gspread_exceptions.APIError = FakeAPIError
+fake_gspread_exceptions.SpreadsheetNotFound = FakeSpreadsheetNotFound
+fake_gspread_exceptions.WorksheetNotFound = FakeWorksheetNotFound
+
+
+fake_gspread.exceptions = fake_gspread_exceptions
+sys.modules["gspread.exceptions"] = fake_gspread_exceptions
+fake_gspread.__path__ = []  # agar 'gspread' dianggap package oleh import system
+fake_auth_exc.GoogleAuthError = type("GoogleAuthError", (Exception,), {})
+
+
+class FakeCredentials:
+    def __init__(self, file, scopes):
+        self.file = file
+        self.scopes = scopes
+
+    @classmethod
+    def from_service_account_file(cls, path, scopes=None):
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if data.get("type") != "service_account":
+            raise ValueError("bukan service account")
+        return cls(path, scopes)
+
+
+fake_sa.Credentials = FakeCredentials
+fake_auth.exceptions = fake_auth_exc
+sys.modules.setdefault("gspread", fake_gspread)
+sys.modules.setdefault("google.auth", fake_auth)
+sys.modules.setdefault("google.auth.exceptions", fake_auth_exc)
+sys.modules.setdefault("google.oauth2.service_account", fake_sa)
+
+WORKSPACE = Path(__file__).resolve().parent
+sys.path.insert(0, str(WORKSPACE))
+
+import config  # noqa: E402
+from sheets import GoogleSheetsManager, HeaderMismatchError  # noqa: E402
+from sheets import sheets_manager as sm  # noqa: E402
+
+# 2. Suntik gspread tiruan ke namespace sheets_manager
+sm.gspread = fake_gspread
+sm.Credentials = FakeCredentials
+sm.APIError = FakeAPIError
+sm.SpreadsheetNotFound = FakeSpreadsheetNotFound
+sm.WorksheetNotFound = FakeWorksheetNotFound
+
+
+class FakeWorksheet:
+    def __init__(self, title="Sheet1"):
+        self.title = title
+        self.grid = []  # list of rows
+
+    def row_values(self, row):
+        index = row - 1
+        if index < 0 or index >= len(self.grid):
+            return []
+        return list(self.grid[index])
+
+    def update(self, values, range_name="A1", value_input_option=None):
+        assert range_name == "A1"
+        self.grid = [list(values[0])]
+        return {"updatedRange": f"{self.title}!A1"}
+
+    def append_row(self, values, value_input_option=None):
+        self.grid.append(list(values))
+        row_number = len(self.grid)
+        last_col = chr(ord("A") + len(values) - 1) if values else "A"
+        return {
+            "updates": {
+                "updatedRange": f"{self.title}!A{row_number}:{last_col}{row_number}"
+            }
+        }
+
+    def update_cell(self, row, column, value):
+        while len(self.grid) < row:
+            self.grid.append([])
+        while len(self.grid[row - 1]) < column:
+            self.grid[row - 1].append("")
+        self.grid[row - 1][column - 1] = value
+
+    def get_all_records(self):
+        if not self.grid:
+            return []
+        headers, *rows = self.grid
+        return [dict(zip(headers, row)) for row in rows]
+
+    def col_values(self, column):
+        """Kolom 1-based; baris kosong diisi "" seperti perilaku gspread."""
+        result = []
+        for row in self.grid:
+            result.append(row[column - 1] if len(row) >= column else "")
+        return result
+
+
+class FakeSpreadsheet:
+    def __init__(self, title):
+        self.title = title
+        self.sheets = {}
+
+    def worksheet(self, title):
+        if title not in self.sheets:
+            raise FakeWorksheetNotFound(title)
+        return self.sheets[title]
+
+    def add_worksheet(self, title, rows, cols):
+        sheet = FakeWorksheet(title)
+        self.sheets[title] = sheet
+        return sheet
+
+    def worksheets(self):
+        return list(self.sheets.values())
+
+
+class FakeClient:
+    def __init__(self, spreadsheet):
+        self._spreadsheet = spreadsheet
+
+    def open(self, name):
+        if name != self._spreadsheet.title:
+            raise FakeSpreadsheetNotFound(name)
+        return self._spreadsheet
+
+
+SPREADSHEET = FakeSpreadsheet(config.SPREADSHEET_NAME)
+
+
+def fake_authorize(credentials):
+    return FakeClient(SPREADSHEET)
+
+
+sm.gspread.authorize = fake_authorize
+
+# File credential contoh yang valid sesuai skema Service Account (bukan asli).
+CRED_PATH = WORKSPACE / "_tmp_fake_credentials.json"
+CRED_PATH.write_text(
+    json.dumps(
+        {
+            "type": "service_account",
+            "project_id": "demo-project",
+            "private_key_id": "abc",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n",
+            "client_email": "sheets-bot@demo-project.iam.gserviceaccount.com",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    ),
+    encoding="utf-8",
+)
+
+failures = []
+
+
+def check(label, condition, extra=""):
+    status = "OK  " if condition else "FAIL"
+    suffix = f" -> {extra}" if extra != "" else ""
+    print(f"[{status}] {label}{suffix}")
+    if not condition:
+        failures.append(label)
+
+
+# ---------------------------------------------------------------------------
+# 3. Jalankan skenario seperti main.py
+# ---------------------------------------------------------------------------
+manager = GoogleSheetsManager(
+    credentials_file=CRED_PATH,
+    spreadsheet_name=config.SPREADSHEET_NAME,
+    worksheet_name=config.WORKSHEET_NAME,
+    headers=config.HEADERS,
+    scopes=config.SCOPES,
+)
+manager.connect()
+check("connect() mengembalikan worksheet", manager.worksheet is not None)
+check(
+    "email Service Account terbaca",
+    manager.service_account_email == "sheets-bot@demo-project.iam.gserviceaccount.com",
+    manager.service_account_email,
+)
+check("get_headers() kosong di awal", manager.get_headers() == [])
+check("ensure_headers() membuat header", manager.ensure_headers() is True)
+check("header sesuai config", manager.get_headers() == config.HEADERS, manager.get_headers())
+check("ensure_headers() idempotent", manager.ensure_headers() is False)
+
+row_number = manager.append_row(config.TEST_ROW)
+check("append_row(dict) menulis baris 2", row_number == 2, row_number)
+records = manager.get_all_records()
+check("get_all_records() berisi data testing", records == [dict(config.TEST_ROW)], records)
+
+row_number = manager.append_row(
+    ["Bisnis Uji", "Restoran", "Bandung", "https://x.id", "Sudah dihubungi"]
+)
+check("append_row(list) menulis baris 3", row_number == 3, row_number)
+
+manager.update_cell(3, 5, "Follow up")
+check("update_cell(3, 5) mengubah sel E3", manager.worksheet.grid[2][4] == "Follow up")
+
+check("_parse_updated_range fallback", sm.GoogleSheetsManager._parse_updated_range({}) == -1)
+check(
+    "_parse_updated_range normal",
+    sm.GoogleSheetsManager._parse_updated_range(
+        {"updates": {"updatedRange": "Sheet1!A7:E7"}}
+    )
+    == 7,
+)
+
+# Header salah -> HeaderMismatchError
+bad = GoogleSheetsManager(
+    credentials_file=CRED_PATH,
+    spreadsheet_name=config.SPREADSHEET_NAME,
+    worksheet_name=config.WORKSHEET_NAME,
+    headers=["Nama", "Kategori", "Kota", "Website", "Status"],
+)
+bad.connect()
+try:
+    bad.ensure_headers()
+    check("HeaderMismatchError terpicu", False)
+except HeaderMismatchError:
+    check("HeaderMismatchError terpicu", True)
+
+# Credential hilang -> CredentialsNotFoundError
+missing = GoogleSheetsManager(
+    credentials_file=WORKSPACE / "tidak-ada.json",
+    spreadsheet_name=config.SPREADSHEET_NAME,
+    worksheet_name=config.WORKSHEET_NAME,
+    headers=config.HEADERS,
+)
+try:
+    missing.connect()
+    check("CredentialsNotFoundError terpicu", False)
+except sm.CredentialsNotFoundError:
+    check("CredentialsNotFoundError terpicu", True)
+
+# Spreadsheet salah nama -> SpreadsheetNotFoundError
+wrong = GoogleSheetsManager(
+    credentials_file=CRED_PATH,
+    spreadsheet_name="Spreadsheet Tidak Ada",
+    worksheet_name=config.WORKSHEET_NAME,
+    headers=config.HEADERS,
+)
+try:
+    wrong.connect()
+    check("SpreadsheetNotFoundError terpicu", False)
+except sm.SpreadsheetNotFoundError:
+    check("SpreadsheetNotFoundError terpicu", True)
+
+# update_cell menolak index 0
+try:
+    manager.update_cell(0, 1, "x")
+    check("update_cell menolak index 0", False)
+except ValueError:
+    check("update_cell menolak index 0", True)
+
+# Worksheet belum ada -> dibuat otomatis saat connect()
+fresh = GoogleSheetsManager(
+    credentials_file=CRED_PATH,
+    spreadsheet_name=config.SPREADSHEET_NAME,
+    worksheet_name="Tab Baru",
+    headers=config.HEADERS,
+)
+fresh.connect()
+check("worksheet baru dibuat otomatis", "Tab Baru" in SPREADSHEET.sheets)
+# ---------------------------------------------------------------------------
+# 4. Scraper: parsing HTML offline (tanpa jaringan)
+# ---------------------------------------------------------------------------
+from scraper import DEFAULT_EMPTY, ScrapeResult, WebsiteScraper  # noqa: E402
+
+HTML_FULL = """
+<html><head>
+<title>Klinik Sehat Sentosa | Jakarta Selatan</title>
+<meta property="og:site_name" content="Klinik Sehat Sentosa">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"MedicalClinic",
+ "name":"Klinik Sehat Sentosa",
+ "telephone":"+62 21 5566 7788",
+ "email":"info@kliniksehatsentosa.co.id",
+ "address":{"@type":"PostalAddress","streetAddress":"Jl. Melati No. 12",
+   "addressLocality":"Jakarta Selatan","addressRegion":"DKI Jakarta",
+   "postalCode":"12140","addressCountry":"ID"}}
+</script></head>
+<body>
+  <h1>Klinik Sehat Sentosa</h1>
+  <a href="mailto:info@kliniksehatsentosa.co.id?subject=Halo">Email kami</a>
+  <a href="tel:+622155667788">Telepon</a>
+  <address>Jl. Melati No. 12, Jakarta Selatan, DKI Jakarta 12140</address>
+</body></html>
+"""
+
+HTML_MINIMAL = (
+    "<html><head><title>Example Domain</title></head>"
+    "<body><h1>Example Domain</h1></body></html>"
+)
+
+HTML_HEURISTIC = """
+<html><head><title>Warung Test</title></head><body>
+  <div><span>Salam dari warung kami</span></div>
+  <p>Alamat: Jl. Kenanga No. 5, Bandung, Jawa Barat</p>
+  <p>Hubungi: 0812-3456-7890</p>
+  <p>Email: halo@warungtest.id</p>
+</body></html>
+"""
+
+scraper = WebsiteScraper(timeout=5)
+
+# Normalisasi URL
+check(
+    "normalize_url tambah https",
+    WebsiteScraper.normalize_url("example.com") == "https://example.com",
+    WebsiteScraper.normalize_url("example.com"),
+)
+check(
+    "normalize_url buang trailing slash & fragment",
+    WebsiteScraper.normalize_url("http://www.Example.com/path/#section")
+    == "http://www.example.com/path",
+    WebsiteScraper.normalize_url("http://www.Example.com/path/#section"),
+)
+check("is_valid_url menerima domain", WebsiteScraper.is_valid_url("tokobaju.id"))
+check("is_valid_url menolak URL kosong", not WebsiteScraper.is_valid_url(""))
+check("is_valid_url menolak skema ftp", not WebsiteScraper.is_valid_url("ftp://x.com"))
+check("is_valid_url menolak tanpa domain", not WebsiteScraper.is_valid_url("localhost"))
+check(
+    "site_key samakan www/http/https",
+    WebsiteScraper.site_key("http://www.x.com/")
+    == WebsiteScraper.site_key("https://x.com"),
+    WebsiteScraper.site_key("http://www.x.com/"),
+)
+
+# ---------------------------------------------------------------------------
+# 5. main.py end-to-end (offline): scraping + anti-duplikat ke sheet tiruan
+# ---------------------------------------------------------------------------
+import main as main_module  # noqa: E402
+
+check("main.py importable", callable(main_module.main))
+
+main_module.config.CREDENTIALS_FILE = CRED_PATH
+main_module.config.REQUEST_DELAY = 0  # jangan menunggu saat testing
+SPREADSHEET.sheets.clear()
+
+# Monkeypatch fetch agar membaca HTML lokal, bukan jaringan.
+FETCH_MAP = {
+    "https://kliniksehatsentosa.co.id": HTML_FULL,
+    "https://example.com": HTML_MINIMAL,
+    "https://warungtest.id": HTML_HEURISTIC,
+}
+_original_fetch = WebsiteScraper.fetch
+
+
+def fake_fetch(self, url):
+    """Ganti jaringan dengan HTML fixture (simulasi offline)."""
+    if url in FETCH_MAP:
+        return FETCH_MAP[url]
+    import requests as _requests
+
+    raise _requests.exceptions.ConnectionError("host tidak dikenal (simulasi)")
+
+
+WebsiteScraper.fetch = fake_fetch
+
+main_module.config.SCRAPE_URLS = [
+    "https://kliniksehatsentosa.co.id",
+    "https://example.com",
+    "https://situs-tidak-ada.invalid",  # website tidak bisa diakses
+    "https://warungtest.id",
+    "http://www.kliniksehatsentosa.co.id/",  # duplikat (beda skema/www/slash)
+]
+
+exit_code = main_module.main(["--urls"] + main_module.config.SCRAPE_URLS)
+check("main() selesai dengan exit 0 (sebagian sukses)", exit_code == 0, exit_code)
+
+
+
+sheet = SPREADSHEET.sheets[config.WORKSHEET_NAME]
+check("main() menulis header 8 kolom", sheet.grid[0] == config.HEADERS, sheet.grid[0])
+check("header punya kolom Email/Nomor Telepon/Alamat", sheet.grid[0][4:] == ["Email", "Nomor Telepon", "Alamat", "Status"], sheet.grid[0])
+
+inserted_rows = sheet.grid[1:]
+check(
+    "3 data unik ter-INSERT (duplikat & gagal tidak masuk)",
+    len(inserted_rows) == 3,
+    len(inserted_rows),
+)
+check(
+    "baris pertama = data lengkap hasil scraping",
+    inserted_rows[0][0] == "Klinik Sehat Sentosa"
+    and inserted_rows[0][3] == "https://kliniksehatsentosa.co.id"
+    and inserted_rows[0][4] == "info@kliniksehatsentosa.co.id"
+    and inserted_rows[0][5] == "+62 2155667788"
+    and inserted_rows[0][6].startswith("Jl. Melati No. 12"),
+    inserted_rows[0],
+)
+check(
+    "Status default 'Belum dihubungi' untuk semua baris baru",
+    all(row[7] == config.STATUS_DEFAULT for row in inserted_rows),
+    [row[7] for row in inserted_rows],
+)
+check(
+    "data example.com memakai '-' untuk field yang kosong",
+    inserted_rows[1][1] == config.EMPTY_VALUE
+    and inserted_rows[1][2] == config.EMPTY_VALUE
+    and inserted_rows[1][4] == config.EMPTY_VALUE
+    and inserted_rows[1][5] == config.EMPTY_VALUE
+    and inserted_rows[1][6] == config.EMPTY_VALUE,
+    inserted_rows[1],
+)
+check(
+    "tidak ada sel kosong pada data hasil scraping",
+    all(str(cell).strip() != "" for row in inserted_rows for cell in row),
+    inserted_rows,
+)
+check(
+    "website duplikat tidak ditambahkan dua kali",
+    sum(1 for row in inserted_rows if "kliniksehatsentosa" in str(row[3])) == 1,
+    [row[3] for row in inserted_rows],
+)
+
+# Anti-duplikat pada level manager
+manager2 = GoogleSheetsManager(
+    credentials_file=CRED_PATH,
+    spreadsheet_name=config.SPREADSHEET_NAME,
+    worksheet_name=config.WORKSHEET_NAME,
+    headers=config.HEADERS,
+)
+manager2.connect()
+check(
+    "find_row_by_website menemukan baris 2",
+    manager2.find_row_by_website("https://kliniksehatsentosa.co.id") == 2,
+    manager2.find_row_by_website("https://kliniksehatsentosa.co.id"),
+)
+check(
+    "website_exists True untuk data terdaftar",
+    manager2.website_exists("https://kliniksehatsentosa.co.id"),
+)
+check("website_exists False untuk domain baru", not manager2.website_exists("https://domain-baru.id"))
+check("website_exists False untuk '-'", not manager2.website_exists("-"))
+check(
+    "website_key samakan http/www/slash",
+    GoogleSheetsManager.website_key("http://www.KlinikSehatSentosa.co.id/")
+    == GoogleSheetsManager.website_key("https://kliniksehatsentosa.co.id"),
+)
+
+# Jalankan main() kedua kali: semua harus SKIP (tanpa duplikat baru)
+exit_code2 = main_module.main(
+    ["--urls", "https://kliniksehatsentosa.co.id", "https://warungtest.id"]
+)
+check("main() kedua kali exit 0 (semua SKIP)", exit_code2 == 0, exit_code2)
+check(
+    "tidak ada baris baru saat re-run",
+    len(SPREADSHEET.sheets[config.WORKSHEET_NAME].grid) == 4,
+    len(SPREADSHEET.sheets[config.WORKSHEET_NAME].grid),
+)
+
+# Google Sheets error saat insert -> program tetap selesai tanpa crash
+_original_append = GoogleSheetsManager.append_row
+
+
+def failing_append(self, data):
+    raise sm.SheetsError("simulasi quota exceeded")
+
+
+# Domain baru agar benar-benar masuk jalur INSERT (bukan SKIP).
+FETCH_MAP["https://domain-baru.id"] = HTML_MINIMAL
+GoogleSheetsManager.append_row = failing_append
+exit_code3 = main_module.main(["--urls", "https://domain-baru.id"])
+check("main() tetap selesai walau Sheets error (exit 1)", exit_code3 == 1, exit_code3)
+check(
+    "Sheets error tidak menambah baris",
+    len(SPREADSHEET.sheets[config.WORKSHEET_NAME].grid) == 4,
+    len(SPREADSHEET.sheets[config.WORKSHEET_NAME].grid),
+)
+GoogleSheetsManager.append_row = _original_append
+
+# URL list kosong -> argparse menolak (--urls butuh minimal satu URL)
+try:
+    main_module.parse_args(["--urls"])
+    check("argparse menolak --urls tanpa URL", False)
+except SystemExit:
+    check("argparse menolak --urls tanpa URL", True)
+
+# ---------------------------------------------------------------------------
+# 6. Discovery OSM (offline): kategori -> query Overpass -> kandidat bisnis
+# ---------------------------------------------------------------------------
+from discovery import (  # noqa: E402
+    BusinessCandidate,
+    BusinessDiscovery,
+    DiscoveryResult,
+    Location,
+    available_keywords,
+    build_category,
+    category_from_tags,
+    detect_keyword,
+    filter_matches_tags,
+    name_filter,
+    normalize_text,
+    parse_query,
+    title_case_place,
+)
+from discovery import osm_discovery as od  # noqa: E402
+
+check("discovery importable", callable(BusinessDiscovery.discover))
+
+match, place = parse_query("klinik di jakarta selatan")
+check(
+    "parse_query mendeteksi kategori 'klinik'",
+    match is not None and match.category == "Klinik",
+    match,
+)
+check("parse_query menyisakan nama daerah", place == "jakarta selatan", place)
+check(
+    "parse_query memakai frasa terpanjang ('klinik gigi')",
+    parse_query("klinik gigi jakarta selatan")[0].category == "Dokter Gigi",
+    parse_query("klinik gigi jakarta selatan")[0],
+)
+check("detect_keyword None tanpa kategori", detect_keyword("xyz abc") is None)
+check(
+    "detect_keyword 'rumah sakit' menang atas 'rumah'",
+    detect_keyword("rumah sakit bandung").category == "Rumah Sakit",
+    detect_keyword("rumah sakit bandung"),
+)
+check("build_category('apotek')", build_category("apotek").category == "Apotek")
+check(
+    "build_category kata kunci asing -> fallback nama",
+    build_category("kedai kopi").fallback_name is True,
+    build_category("kedai kopi"),
+)
+check(
+    "name_filter case-insensitive",
+    name_filter("Kedai Kopi") == '["name"~"kedai kopi",i]',
+    name_filter("Kedai Kopi"),
+)
+check(
+    "normalize_text membersihkan tanda baca",
+    normalize_text("Klinik Sehat, Jl.!") == "klinik sehat jl",
+    normalize_text("Klinik Sehat, Jl.!"),
+)
+check(
+    "title_case_place",
+    title_case_place("jakarta selatan") == "Jakarta Selatan",
+    title_case_place("jakarta selatan"),
+)
+check("available_keywords berisi 'klinik'", "klinik" in available_keywords())
+
+# --- filter Overpass -> tag OSM (AND di dalam satu filter, OR antar filter) ---
+check(
+    "filter_matches_tags cocok (amenity=pharmacy)",
+    filter_matches_tags('["amenity"="pharmacy"]', {"amenity": "pharmacy"}),
+)
+check(
+    "filter_matches_tags menolak tag berbeda",
+    not filter_matches_tags('["amenity"="pharmacy"]', {"amenity": "clinic"}),
+)
+check(
+    "filter_matches_tags mendukung regex '^(a|b)$'",
+    filter_matches_tags('["amenity"~"^(clinic|doctors)$"]', {"amenity": "doctors"}),
+)
+check(
+    "filter_matches_tags AND antar kondisi",
+    filter_matches_tags(
+        '["amenity"="place_of_worship"]["religion"="muslim"]',
+        {"amenity": "place_of_worship", "religion": "muslim"},
+    )
+    and not filter_matches_tags(
+        '["amenity"="place_of_worship"]["religion"="muslim"]',
+        {"amenity": "place_of_worship", "religion": "christian"},
+    ),
+)
+check("filter_matches_tags tanpa tag -> False", not filter_matches_tags('["amenity"]', {}))
+
+check(
+    "category_from_tags(amenity=pharmacy) -> Apotek",
+    category_from_tags({"amenity": "pharmacy"}) == "Apotek",
+    category_from_tags({"amenity": "pharmacy"}),
+)
+check(
+    "category_from_tags(amenity=dentist) -> Dokter Gigi",
+    category_from_tags({"amenity": "dentist"}) == "Dokter Gigi",
+    category_from_tags({"amenity": "dentist"}),
+)
+check(
+    "category_from_tags(healthcare=clinic) -> Klinik",
+    category_from_tags({"healthcare": "clinic"}) == "Klinik",
+    category_from_tags({"healthcare": "clinic"}),
+)
+check("category_from_tags tag asing -> None", category_from_tags({"shop": "car"}) is None)
+
+# --- Location + penyusunan query Overpass ---
+location = Location(
+    query="jakarta selatan",
+    display_name="Jakarta Selatan, DKI Jakarta, Indonesia",
+    osm_type="relation",
+    osm_id=7647556,
+    boundingbox=(-6.4, -6.1, 106.6, 106.9),
+    city="Jakarta Selatan",
+    addresstype="city_district",
+    place_type="administrative",
+)
+check("Location.area_id = 3600000000 + osm_id", location.area_id == 3607647556, location.area_id)
+check("Location.bbox format Overpass", location.bbox == "-6.4,106.6,-6.1,106.9", location.bbox)
+check("Location.label", location.label.startswith("Jakarta Selatan"), location.label)
+
+query_text = BusinessDiscovery.build_overpass_query(
+    build_category("klinik").filters, location, limit=15
+)
+check("query Overpass diawali header [out:json]", query_text.startswith("[out:json][timeout="), query_text[:40])
+check("query Overpass memakai area relation", "area(3607647556)->.a;" in query_text, query_text)
+check("query Overpass memakai scope area.a", "(area.a)" in query_text, query_text)
+check("query Overpass menutup dengan 'out center tags 15;'", query_text.endswith("out center tags 15;"), query_text[-30:])
+
+bbox_location = Location(
+    query="bandung",
+    display_name="Bandung",
+    osm_type="node",
+    osm_id=123,
+    boundingbox=(-6.95, -6.85, 107.55, 107.7),
+    city="Bandung",
+)
+bbox_query = BusinessDiscovery.build_overpass_query(['["amenity"="cafe"]'], bbox_location)
+check("query Overpass fallback bbox bila bukan relation", "(-6.95,107.55,-6.85,107.7)" in bbox_query, bbox_query)
+check("bbox_location.area_id None", bbox_location.area_id is None)
+
+try:
+    BusinessDiscovery.build_overpass_query([], location)
+    check("build_overpass_query menolak filter kosong", False)
+except ValueError:
+    check("build_overpass_query menolak filter kosong", True)
+
+try:
+    BusinessDiscovery.build_overpass_query(['["amenity"="cafe"]'], None)
+    check("build_overpass_query menolak location kosong", False)
+except ValueError:
+    check("build_overpass_query menolak location kosong", True)
+
+# --- to_candidates: elemen OSM -> BusinessCandidate ---
+OSM_ELEMENTS = [
+    {  # lengkap: website + telepon + alamat
+        "type": "node",
+        "id": 101,
+        "lat": -6.2615,
+        "lon": 106.8106,
+        "tags": {
+            "name": "Klinik Sehat Sentosa",
+            "amenity": "clinic",
+            "website": "kliniksehatsentosa.co.id",
+            "phone": "+62 21 5566 7788",
+            "addr:street": "Jl. Melati",
+            "addr:housenumber": "12",
+            "addr:postcode": "12140",
+        },
+    },
+    {  # tanpa nama -> dibuang & dihitung
+        "type": "way",
+        "id": 102,
+        "center": {"lat": -6.27, "lon": 106.82},
+        "tags": {"amenity": "clinic"},
+    },
+    {  # duplikat website (beda protokol/www/slash) dari elemen pertama
+        "type": "node",
+        "id": 103,
+        "lat": -6.2616,
+        "lon": 106.8107,
+        "tags": {"name": "Klinik Sehat Sentosa 2", "amenity": "clinic",
+                 "contact:website": "https://www.kliniksehatsentosa.co.id/"},
+    },
+    {  # sudah tutup -> dibuang tanpa dihitung "tanpa nama"
+        "type": "node",
+        "id": 104,
+        "tags": {"name": "Klinik Tutup", "amenity": "clinic", "disused:amenity": "clinic"},
+    },
+    {  # tanpa website: email & telepon dari tag contact:*
+        "type": "node",
+        "id": 105,
+        "lat": -6.28,
+        "lon": 106.83,
+        "tags": {"name": "Klinik Tanpa Situs", "healthcare": "clinic",
+                 "contact:email": "info@tanpasitus.id; lain@tanpasitus.id",
+                 "contact:phone": "021-7654321", "addr:city": "Jakarta Selatan"},
+    },
+]
+
+discovery = BusinessDiscovery(delay=0, session=_FakeDiscoverySession())
+candidates, skipped_names = discovery.to_candidates(OSM_ELEMENTS, location, fallback_category="Klinik")
+check("to_candidates membuang elemen tanpa nama (1)", skipped_names == 1, skipped_names)
+check("to_candidates membuang tempat tutup", len(candidates) == 3, [c.name for c in candidates])
+
+first = candidates[0]
+check("nama bisnis dirapikan", first.name == "Klinik Sehat Sentosa", first.name)
+check("kategori dari tag OSM", first.category == "Klinik", first.category)
+check("website tanpa skema diberi https", first.website == "https://kliniksehatsentosa.co.id", first.website)
+check("telepon diambil dari tag phone", first.phone == "+62 21 5566 7788", first.phone)
+check("alamat disusun dari addr:*", first.address == "Jl. Melati 12, 12140", first.address)
+check("kota diisi dari Location", first.city == "Jakarta Selatan", first.city)
+check("koordinat node terbaca", (first.lat, first.lon) == (-6.2615, 106.8106), (first.lat, first.lon))
+check("osm_id tersimpan", first.osm_id == 101 and first.osm_type == "node", (first.osm_type, first.osm_id))
+
+no_site = candidates[-1]
+check("email tag ';' diambil yang pertama", no_site.email == "info@tanpasitus.id", no_site.email)
+check("kandidat tanpa website -> '-'", no_site.website == "-", no_site.website)
+check("telepon contact:phone dipakai", no_site.phone == "021-7654321", no_site.phone)
+
+check(
+    "as_row() menghasilkan 8 kolom config.HEADERS",
+    list(first.as_row()) == config.HEADERS,
+    list(first.as_row()),
+)
+check(
+    "identity = nama|kota (huruf kecil)",
+    first.identity == "klinik sehat sentosa|jakarta selatan",
+    first.identity,
+)
+
+# --- dedup: nama+kota sama ATAU website sama ---
+same_identity = [
+    BusinessCandidate(name="Klinik A", city="Bandung"),
+    BusinessCandidate(name="klinik a!", city="bandung"),
+    BusinessCandidate(name="Klinik B", city="Bandung", website="https://x.id/"),
+    BusinessCandidate(name="Klinik C", city="Bandung", website="http://www.x.id"),
+    BusinessCandidate(name="Klinik D", city="Bandung"),
+]
+unique, removed = BusinessDiscovery._dedup(same_identity)
+check("_dedup membuang 2 duplikat", removed == 2, removed)
+check("_dedup menyisakan 3 kandidat unik", len(unique) == 3, [c.name for c in unique])
+
+WebsiteScraper.fetch = _original_fetch
+CRED_PATH.unlink(missing_ok=True)
+
+print("-" * 60)
+if failures:
+    print(f"SELESAI: {len(failures)} pemeriksaan GAGAL: {failures}")
+    sys.exit(1)
+print("SELESAI: semua pemeriksaan lulus (offline, tanpa panggilan Google API).")

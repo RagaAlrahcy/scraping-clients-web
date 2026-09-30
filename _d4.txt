@@ -1,0 +1,76 @@
+501|             text = BusinessDiscovery._clean(value)
+502|             if not text:
+503|                 continue
+504|             for chunk in re.split(r"[;,]", text):
+505|                 candidate = chunk.strip()
+506|                 if re.match(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$", candidate):
+507|                     return candidate.lower()
+508|         return ""
+509| 
+510|     @staticmethod
+511|     def _build_address(tags: Dict[str, Any]) -> str:
+512|         """Susun alamat dari tag addr:* (fallback ke tag alamat bebas)."""
+513|         street = " ".join(
+514|             part
+515|             for part in (
+516|                 BusinessDiscovery._clean(tags.get("addr:street")),
+517|                 BusinessDiscovery._clean(tags.get("addr:housenumber")),
+518|             )
+519|             if part
+520|         )
+521|         if not street:
+522|             street = BusinessDiscovery._clean(tags.get("address"))
+523| 
+524|         parts = [
+525|             street,
+526|             BusinessDiscovery._clean(tags.get("addr:suburb") or tags.get("addr:hamlet")),
+527|             BusinessDiscovery._clean(tags.get("addr:city") or tags.get("addr:town")),
+528|             BusinessDiscovery._clean(tags.get("addr:postcode")),
+529|         ]
+530|         return ", ".join(part for part in parts if part)
+531| 
+532|     @staticmethod
+533|     def _coordinates(element: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+534|         """Ambil koordinat dari node atau dari `center` (way/relation)."""
+535|         for source in (element, element.get("center") or {}):
+536|             lat = source.get("lat")
+537|             lon = source.get("lon")
+538|             if lat is None or lon is None:
+539|                 continue
+540|             try:
+541|                 return float(lat), float(lon)
+542|             except (TypeError, ValueError):
+543|                 continue
+544|         return None, None
+545| 
+546|     @staticmethod
+547|     def _is_inactive(tags: Dict[str, Any]) -> bool:
+548|         """True bila tag menandakan tempat sudah tutup/tidak dipakai."""
+549|         for key in _INACTIVE_KEYS:
+550|             value = str(tags.get(key, "")).strip().lower()
+551|             if value and (value in _INACTIVE_VALUES or value.startswith("disused")):
+552|                 return True
+553| 
+554|         lifecycle = str(tags.get("lifecycle") or "").strip().lower()
+555|         return lifecycle in _INACTIVE_VALUES
+556| 
+557|     # ------------------------------------------------------------------
+558|     # Tahap 4: anti-duplikat
+559|     # ------------------------------------------------------------------
+560|     @staticmethod
+561|     def _dedup(candidates: Iterable[BusinessCandidate]) -> Tuple[List[BusinessCandidate], int]:
+562|         """Buang duplikat (nama+kota sama, atau website sama).
+563| 
+564|         Return (kandidat_unik, jumlah_duplikat_dibuang). Kemunculan pertama
+565|         dipertahankan karena urutan hasil Overpass tidak dijamin.
+566|         """
+567|         unique: List[BusinessCandidate] = []
+568|         seen_identity: set = set()
+569|         seen_website: set = set()
+570|         removed = 0
+571| 
+572|         for candidate in candidates:
+573|             identity = candidate.identity
+574|             website = normalize_text(candidate.website)
+575|             has_website = candidate.website not in ("", "-")
+576| 

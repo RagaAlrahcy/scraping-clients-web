@@ -1,0 +1,161 @@
+        for value in values:
+            text = BusinessDiscovery._clean(value)
+            if not text:
+                continue
+            for chunk in re.split(r"[;,]", text):
+                candidate = chunk.strip()
+                if re.match(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$", candidate):
+                    return candidate.lower()
+        return ""
+
+    @staticmethod
+    def _build_address(tags: Dict[str, Any]) -> str:
+        """Susun alamat dari tag addr:* (fallback ke tag alamat bebas)."""
+        street = " ".join(
+            part
+            for part in (
+                BusinessDiscovery._clean(tags.get("addr:street")),
+                BusinessDiscovery._clean(tags.get("addr:housenumber")),
+            )
+            if part
+        )
+        if not street:
+            street = BusinessDiscovery._clean(tags.get("address"))
+
+        parts = [
+            street,
+            BusinessDiscovery._clean(tags.get("addr:suburb") or tags.get("addr:hamlet")),
+            BusinessDiscovery._clean(tags.get("addr:city") or tags.get("addr:town")),
+            BusinessDiscovery._clean(tags.get("addr:postcode")),
+        ]
+        return ", ".join(part for part in parts if part)
+
+    @staticmethod
+    def _coordinates(element: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+        """Ambil koordinat dari node atau dari `center` (way/relation)."""
+        for source in (element, element.get("center") or {}):
+            lat = source.get("lat")
+            lon = source.get("lon")
+            if lat is None or lon is None:
+                continue
+            try:
+                return float(lat), float(lon)
+            except (TypeError, ValueError):
+                continue
+        return None, None
+
+    @staticmethod
+    def _is_inactive(tags: Dict[str, Any]) -> bool:
+        """True bila tag menandakan tempat sudah tutup/tidak dipakai."""
+        for key in _INACTIVE_KEYS:
+            value = str(tags.get(key, "")).strip().lower()
+            if value and (value in _INACTIVE_VALUES or value.startswith("disused")):
+                return True
+
+        lifecycle = str(tags.get("lifecycle") or "").strip().lower()
+        return lifecycle in _INACTIVE_VALUES
+
+    # ------------------------------------------------------------------
+    # Tahap 4: anti-duplikat
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _dedup(candidates: Iterable[BusinessCandidate]) -> Tuple[List[BusinessCandidate], int]:
+        """Buang duplikat (nama+kota sama, atau website sama).
+
+        Return (kandidat_unik, jumlah_duplikat_dibuang). Kemunculan pertama
+        dipertahankan karena urutan hasil Overpass tidak dijamin.
+        """
+        unique: List[BusinessCandidate] = []
+        seen_identity: set = set()
+        seen_website: set = set()
+        removed = 0
+
+        for candidate in candidates:
+            identity = candidate.identity
+            website = normalize_text(candidate.website)
+            has_website = candidate.website not in ("", "-")
+
+            if identity in seen_identity or (has_website and website in seen_website):
+                removed += 1
+                continue
+
+            seen_identity.add(identity)
+            if has_website:
+                seen_website.add(website)
+            unique.append(candidate)
+
+        return unique, removed
+
+    # ------------------------------------------------------------------
+    # Tahap 5: orkestrasi
+    # ------------------------------------------------------------------
+    def find_businesses(
+        self,
+        filters: Iterable[str],
+        location: Location,
+        limit: int = 50,
+        fallback_category: Optional[str] = None,
+    ) -> Tuple[List[BusinessCandidate], int, int, str]:
+        """Jalankan Overpass untuk Location yang sudah di-geocode.
+
+        Return (kandidat, jumlah_mentah, jumlah_tanpa_nama, url_mirror).
+        """
+        try:
+            query = self.build_overpass_query(filters, location, limit=limit)
+        except ValueError as exc:
+            self.last_errors.append(str(exc))
+            return [], 0, 0, ""
+
+        payload, url = self._overpass_request(query)
+        if payload is None:
+            return [], 0, 0, ""
+
+        elements = payload.get("elements") or []
+        candidates, skipped = self.to_candidates(
+            elements, location, fallback_category=fallback_category
+        )
+        return candidates, len(elements), skipped, url
+
+    def discover(
+        self,
+        query_text: str,
+        limit: int = 50,
+        keyword: Optional[str] = None,
+        enrich_emails: bool = True,
+        scraper: Optional[WebsiteScraper] = None,
+    ) -> DiscoveryResult:
+        """Cari bisnis dari kalimat pencarian bebas.
+
+        Args:
+            query_text: mis. "klinik jakarta selatan".
+            limit: jumlah maksimum baris yang dikembalikan.
+            keyword: paksa kategori tertentu (mengabaikan deteksi otomatis).
+            enrich_emails: lengkapi email via WebsiteScraper bila tag OSM kosong.
+            scraper: instance WebsiteScraper yang dipakai ulang (opsional).
+
+        Return DiscoveryResult - tidak pernah melempar exception jaringan.
+        """
+        self.last_errors = []
+        self.last_overpass_url = ""
+
+        raw_query = str(query_text or "").strip()
+        if not raw_query:
+            return DiscoveryResult(
+                query=raw_query, errors=["Kata kunci pencarian kosong."]
+            )
+
+        # 1) Pisahkan kategori + nama daerah.
+        if keyword:
+            category = build_category(keyword)
+            place = strip_keyword(raw_query, detect_keyword(raw_query) or category)
+        else:
+            category, place = parse_query(raw_query)
+
+        # Kata kunci WAJIB dibuang sebelum geocode; kalau tidak, Nominatim
+        # mengembalikan POI (mis. "klinik jakarta selatan" -> klinik, bukan kota).
+        if not place:
+            place = raw_query
+        if category is None:
+            category = build_category(place)
+
+        result = DiscoveryResult(query=raw_query, category=category)

@@ -1,0 +1,105 @@
+        for candidate in result.candidates:
+            print(candidate.name, candidate.website)
+
+    Semua kegagalan jaringan dikembalikan sebagai DiscoveryResult(errors=[...]),
+    tidak dilempar ke pemanggil - sama seperti WebsiteScraper.scrape().
+    """
+
+    def __init__(
+        self,
+        timeout: int = DISCOVERY_TIMEOUT,
+        headers: Optional[Dict[str, str]] = None,
+        nominatim_url: str = DEFAULT_NOMINATIM_URL,
+        overpass_urls: Optional[Sequence[str]] = None,
+        session: Optional[requests.Session] = None,
+        delay: float = DISCOVERY_DELAY,
+        include_no_website: bool = True,
+        user_agent: str = DEFAULT_USER_AGENT,
+    ) -> None:
+        self.timeout = int(timeout)
+        self.nominatim_url = nominatim_url
+        self.overpass_urls = [url for url in (overpass_urls or DEFAULT_OVERPASS_URLS) if url]
+        self.delay = float(delay)
+        self.include_no_website = bool(include_no_website)
+
+        self.session = session if session is not None else requests.Session()
+        base_headers = {"User-Agent": user_agent, "Accept": "application/json"}
+        base_headers.update(headers or {})
+        self.session.headers.update(base_headers)
+
+        # Diisi setelah discover() berjalan (dipakai untuk log/testing).
+        self.last_overpass_url = ""
+        self.last_errors: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Tahap 1: geocode nama daerah -> Location
+    # ------------------------------------------------------------------
+    def geocode_place(self, place: str) -> Optional[Location]:
+        """Ubah nama daerah menjadi Location (bbox + area id).
+
+        Return None bila daerah tidak ditemukan atau request gagal.
+        """
+        cleaned = _WHITESPACE_RE.sub(" ", str(place or "")).strip()
+        if not cleaned:
+            return None
+
+        params = {
+            "q": cleaned,
+            "format": "jsonv2",
+            "limit": 1,
+            "addressdetails": 1,
+        }
+
+        try:
+            response = self.session.get(
+                self.nominatim_url, params=params, timeout=NOMINATIM_TIMEOUT
+            )
+        except requests.exceptions.RequestException as exc:
+            self.last_errors.append(f"Nominatim gagal dihubungi: {self._short(exc)}")
+            return None
+
+        if response.status_code != 200:
+            self.last_errors.append(
+                f"Nominatim HTTP {response.status_code} untuk daerah '{cleaned}'."
+            )
+            return None
+
+        try:
+            payload = response.json()
+        except ValueError:
+            self.last_errors.append("Respons Nominatim bukan JSON yang valid.")
+            return None
+
+        if not isinstance(payload, list) or not payload:
+            self.last_errors.append(
+                f"Daerah '{cleaned}' tidak ditemukan di OpenStreetMap."
+            )
+            return None
+
+        location = self._location_from_payload(payload[0], cleaned)
+        if location is None:
+            self.last_errors.append(
+                f"Daerah '{cleaned}' tidak punya bounding box yang bisa dipakai."
+            )
+        return location
+
+    @staticmethod
+    def _location_from_payload(item: Dict[str, Any], query: str) -> Optional[Location]:
+        """Bangun Location dari satu objek hasil Nominatim."""
+        try:
+            south, north, west, east = (float(value) for value in (item.get("boundingbox") or [])[:4])
+        except (TypeError, ValueError):
+            return None
+
+        address = item.get("address") or {}
+        city = (
+            address.get("city_district")
+            or address.get("city")
+            or address.get("town")
+            or address.get("municipality")
+            or address.get("county")
+            or item.get("name")
+            or query
+        )
+
+        try:

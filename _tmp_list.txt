@@ -1,0 +1,35 @@
+﻿
+FullName                                                                                                         Length
+--------                                                                                                         ------
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\discovery\categories.py                             9448
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\scraper\scraper.py                                 21503
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\scraper\__init__.py                                  301
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\scraper\__pycache__\scraper.cpython-311.pyc        29811
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\scraper\__pycache__\__init__.cpython-311.pyc         530
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\sheets\sheets_manager.py                           13992
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\sheets\__init__.py                                   358
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\sheets\__pycache__\sheets_manager.cpython-311.pyc  19524
+C:\Users\msi modern\OneDrive\Desktop\scraping-clients-web-main\sheets\__pycache__\__init__.cpython-311.pyc          528
+
+
+
+Name                    
+----                    
+.git                    
+.venv                   
+discovery               
+scraper                 
+sheets                  
+__pycache__             
+.gitignore              
+config.py               
+credentials.json        
+credentials.json.example
+main.py                 
+README.md               
+requirements.txt        
+selfcheck_offline.py    
+_tmp_list.txt           
+
+
+True

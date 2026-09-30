@@ -1,0 +1,119 @@
+1|     osm_type="node",
+2|     osm_id=123,
+3|     boundingbox=(-6.95, -6.85, 107.55, 107.7),
+4|     city="Bandung",
+5| )
+6| bbox_query = BusinessDiscovery.build_overpass_query(['["amenity"="cafe"]'], bbox_location)
+7| check("query Overpass fallback bbox bila bukan relation", "(-6.95,107.55,-6.85,107.7)" in bbox_query, bbox_query)
+8| check("bbox_location.area_id None", bbox_location.area_id is None)
+9| 
+10| try:
+11|     BusinessDiscovery.build_overpass_query([], location)
+12|     check("build_overpass_query menolak filter kosong", False)
+13| except ValueError:
+14|     check("build_overpass_query menolak filter kosong", True)
+15| 
+16| try:
+17|     BusinessDiscovery.build_overpass_query(['["amenity"="cafe"]'], None)
+18|     check("build_overpass_query menolak location kosong", False)
+19| except ValueError:
+20|     check("build_overpass_query menolak location kosong", True)
+21| 
+22| # --- to_candidates: elemen OSM -> BusinessCandidate ---
+23| OSM_ELEMENTS = [
+24|     {  # lengkap: website + telepon + alamat
+25|         "type": "node",
+26|         "id": 101,
+27|         "lat": -6.2615,
+28|         "lon": 106.8106,
+29|         "tags": {
+30|             "name": "Klinik Sehat Sentosa",
+31|             "amenity": "clinic",
+32|             "website": "kliniksehatsentosa.co.id",
+33|             "phone": "+62 21 5566 7788",
+34|             "addr:street": "Jl. Melati",
+35|             "addr:housenumber": "12",
+36|             "addr:postcode": "12140",
+37|         },
+38|     },
+39|     {  # tanpa nama -> dibuang & dihitung
+40|         "type": "way",
+41|         "id": 102,
+42|         "center": {"lat": -6.27, "lon": 106.82},
+43|         "tags": {"amenity": "clinic"},
+44|     },
+45|     {  # duplikat website (beda protokol/www/slash) dari elemen pertama
+46|         "type": "node",
+47|         "id": 103,
+48|         "lat": -6.2616,
+49|         "lon": 106.8107,
+50|         "tags": {"name": "Klinik Sehat Sentosa 2", "amenity": "clinic",
+51|                  "contact:website": "https://www.kliniksehatsentosa.co.id/"},
+52|     },
+53|     {  # sudah tutup -> dibuang tanpa dihitung "tanpa nama"
+54|         "type": "node",
+55|         "id": 104,
+56|         "tags": {"name": "Klinik Tutup", "amenity": "clinic", "disused:amenity": "clinic"},
+57|     },
+58|     {  # tanpa website: email & telepon dari tag contact:*
+59|         "type": "node",
+60|         "id": 105,
+61|         "lat": -6.28,
+62|         "lon": 106.83,
+63|         "tags": {"name": "Klinik Tanpa Situs", "healthcare": "clinic",
+64|                  "contact:email": "info@tanpasitus.id; lain@tanpasitus.id",
+65|                  "contact:phone": "021-7654321", "addr:city": "Jakarta Selatan"},
+66|     },
+67| ]
+68| 
+69| discovery = BusinessDiscovery(delay=0, session=_FakeDiscoverySession())
+70| candidates, skipped_names = discovery.to_candidates(OSM_ELEMENTS, location, fallback_category="Klinik")
+71| check("to_candidates membuang elemen tanpa nama (1)", skipped_names == 1, skipped_names)
+72| check("to_candidates membuang tempat tutup", len(candidates) == 3, [c.name for c in candidates])
+73| 
+74| first = candidates[0]
+75| check("nama bisnis dirapikan", first.name == "Klinik Sehat Sentosa", first.name)
+76| check("kategori dari tag OSM", first.category == "Klinik", first.category)
+77| check("website tanpa skema diberi https", first.website == "https://kliniksehatsentosa.co.id", first.website)
+78| check("telepon diambil dari tag phone", first.phone == "+62 21 5566 7788", first.phone)
+79| check("alamat disusun dari addr:*", first.address == "Jl. Melati 12, 12140", first.address)
+80| check("kota diisi dari Location", first.city == "Jakarta Selatan", first.city)
+81| check("koordinat node terbaca", (first.lat, first.lon) == (-6.2615, 106.8106), (first.lat, first.lon))
+82| check("osm_id tersimpan", first.osm_id == 101 and first.osm_type == "node", (first.osm_type, first.osm_id))
+83| 
+84| no_site = candidates[-1]
+85| check("email tag ';' diambil yang pertama", no_site.email == "info@tanpasitus.id", no_site.email)
+86| check("kandidat tanpa website -> '-'", no_site.website == "-", no_site.website)
+87| check("telepon contact:phone dipakai", no_site.phone == "021-7654321", no_site.phone)
+88| 
+89| check(
+90|     "as_row() menghasilkan 8 kolom config.HEADERS",
+91|     list(first.as_row()) == config.HEADERS,
+92|     list(first.as_row()),
+93| )
+94| check(
+95|     "identity = nama|kota (huruf kecil)",
+96|     first.identity == "klinik sehat sentosa|jakarta selatan",
+97|     first.identity,
+98| )
+99| 
+100| # --- dedup: nama+kota sama ATAU website sama ---
+101| same_identity = [
+102|     BusinessCandidate(name="Klinik A", city="Bandung"),
+103|     BusinessCandidate(name="klinik a!", city="bandung"),
+104|     BusinessCandidate(name="Klinik B", city="Bandung", website="https://x.id/"),
+105|     BusinessCandidate(name="Klinik C", city="Bandung", website="http://www.x.id"),
+106|     BusinessCandidate(name="Klinik D", city="Bandung"),
+107| ]
+108| unique, removed = BusinessDiscovery._dedup(same_identity)
+109| check("_dedup membuang 2 duplikat", removed == 2, removed)
+110| check("_dedup menyisakan 3 kandidat unik", len(unique) == 3, [c.name for c in unique])
+111| 
+112| WebsiteScraper.fetch = _original_fetch
+113| CRED_PATH.unlink(missing_ok=True)
+114| 
+115| print("-" * 60)
+116| if failures:
+117|     print(f"SELESAI: {len(failures)} pemeriksaan GAGAL: {failures}")
+118|     sys.exit(1)
+119| print("SELESAI: semua pemeriksaan lulus (offline, tanpa panggilan Google API).")

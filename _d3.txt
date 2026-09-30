@@ -1,0 +1,44 @@
+107|     def label(self) -> str:
+108|         """Nama daerah yang enak dibaca (untuk terminal/log)."""
+109|         return self.display_name or self.city or self.query
+110| 
+111| 
+112| @dataclass
+113| class BusinessCandidate:
+114|     """Satu bisnis hasil discovery, siap dipetakan ke kolom Google Sheets."""
+115| 
+116|     name: str
+117|     category: str = "-"
+118|     city: str = "-"
+119|     website: str = "-"
+120|     email: str = "-"
+121|     phone: str = "-"
+122|     address: str = "-"
+123|     status: str = "-"
+124|     osm_type: str = ""
+125|     osm_id: int = 0
+126|     lat: Optional[float] = None
+127|     lon: Optional[float] = None
+128|     source: str = "OpenStreetMap"
+129| 
+130|     @property
+131|     def identity(self) -> str:
+132|         """Kunci anti-duplikat untuk bisnis tanpa website."""
+133|         return f"{normalize_text(self.name)}|{normalize_text(self.city)}"
+134| 
+135|     def as_row(self) -> Dict[str, str]:
+136|         """Dict 8 kolom sesuai config.HEADERS."""
+137|         return {
+138|             "Nama Bisnis": self.name,
+139|             "Kategori": self.category,
+140|             "Kota": self.city,
+141|             "Website": self.website,
+142|             "Email": self.email,
+143|             "Nomor Telepon": self.phone,
+144|             "Alamat": self.address,
+145|             "Status": self.status,
+146|         }
+147| 
+148| 
+149| @dataclass
+150| class DiscoveryResult:

@@ -1,0 +1,163 @@
+               "Header worksheet tidak sesuai.\n"
+                f"  Diharapkan : {self.headers}\n"
+                f"  Ditemukan  : {current}"
+            )
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Anti-duplikat & util
+    # ------------------------------------------------------------------
+    def is_empty(self) -> bool:
+        """True bila worksheet belum punya data (hanya header/kosong)."""
+        try:
+            return len(self.get_all_records()) == 0
+        except SheetsError:
+            return len(self.get_headers()) == 0
+
+    def find_row_by_website(self, website: str) -> int:
+        """Cari nomor baris (1-based) yang kolom Website-nya cocok.
+
+        Return -1 bila tidak ditemukan. Pencocokan memakai normalisasi
+        (tanpa skema, tanpa www, tanpa trailing slash) supaya
+        'http://www.x.com/' dan 'https://x.com' dianggap sama.
+        """
+        key = self.website_key(website)
+        if not key:
+            return -1
+
+        headers = self.get_headers() or self.headers
+        if "Website" not in headers:
+            raise SheetsError("Kolom 'Website' tidak ada di header worksheet.")
+
+        website_column = headers.index("Website") + 1
+
+        try:
+            column_values = self._require_worksheet().col_values(website_column)
+        except APIError as exc:
+            raise SheetsError(self._explain_api_error(exc)) from exc
+
+        # Baris 0 = header, jadi nomor baris = index + 1.
+        for index, value in enumerate(column_values):
+            if index == 0:
+                continue
+            if self.website_key(str(value)) == key:
+                return index + 1
+
+        return -1
+
+    def website_exists(self, website: str) -> bool:
+        """True bila website sudah terdaftar di worksheet (anti-duplikat)."""
+        return self.find_row_by_website(website) > 0
+
+    @staticmethod
+    def website_key(website: Any) -> str:
+        """Normalisasi URL untuk perbandingan anti-duplikat."""
+        text = str(website or "").strip().lower()
+        if not text or text in ("-", "none", "null"):
+            return ""
+
+        # Buang protokol.
+        for prefix in ("https://", "http://"):
+            if text.startswith(prefix):
+                text = text[len(prefix) :]
+                break
+
+        text = text.split("#")[0].rstrip("/")
+
+        # Buang www.
+        if text.startswith("www."):
+            text = text[4:]
+
+        return text
+
+    @staticmethod
+    def identity_key(name: Any, city: Any = "") -> str:
+        """Normalisasi 'nama bisnis + kota' untuk anti-duplikat.
+
+        Dipakai untuk bisnis tanpa website (Website = "-") yang tidak bisa
+        dicocokkan lewat `website_key()`.
+        """
+        parts = []
+        for value in (name, city):
+            text = str(value or "").strip().lower()
+            if text in ("-", "none", "null"):
+                text = ""
+            # Sisakan huruf/angka saja agar "Klinik Sehat, Jl." == "klinik sehat jl".
+            text = re.sub(r"[^0-9a-z]+", " ", text).strip()
+            text = re.sub(r"\s+", " ", text)
+            parts.append(text)
+
+        if not parts[0]:
+            return ""
+        return f"{parts[0]}|{parts[1]}"
+
+    def find_row_by_identity(self, name: str, city: str = "") -> int:
+        """Cari nomor baris (1-based) berdasarkan Nama Bisnis + Kota.
+
+        Return -1 bila tidak ditemukan. Dipakai main.py agar bisnis tanpa
+        website (Website = "-") tidak ditulis berulang di sheet.
+        """
+        key = self.identity_key(name, city)
+        if not key:
+            return -1
+
+        headers = self.get_headers() or self.headers
+        if "Nama Bisnis" not in headers:
+            raise SheetsError("Kolom 'Nama Bisnis' tidak ada di header worksheet.")
+
+        name_column = headers.index("Nama Bisnis") + 1
+        city_column = headers.index("Kota") + 1 if "Kota" in headers else -1
+
+        sheet = self._require_worksheet()
+        try:
+            name_values = sheet.col_values(name_column)
+            city_values = sheet.col_values(city_column) if city_column > 0 else []
+        except APIError as exc:
+            raise SheetsError(self._explain_api_error(exc)) from exc
+
+        for index, value in enumerate(name_values):
+            if index == 0:  # baris header
+                continue
+            city_value = city_values[index] if index < len(city_values) else ""
+            if self.identity_key(value, city_value) == key:
+                return index + 1
+
+        return -1
+
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
+    def get_all_records(self) -> List[Dict[str, Any]]:
+        """Ambil seluruh baris data sebagai list of dict (key = header)."""
+        sheet = self._require_worksheet()
+        try:
+            return sheet.get_all_records()
+        except APIError as exc:
+            raise SheetsError(self._explain_api_error(exc)) from exc
+
+    def append_row(self, data: Union[Dict[str, Any], Sequence[Any]]) -> int:
+        """Tambahkan satu baris data.
+
+        data boleh berupa dict (dipetakan sesuai header worksheet) atau list/tuple
+        (urutan harus sama dengan header). Return nomor baris yang ditulis,
+        atau -1 jika nomor baris tidak bisa dibaca dari response.
+        """
+        sheet = self._require_worksheet()
+        values = self._to_row(data)
+
+        try:
+            result = sheet.append_row(values, value_input_option="RAW")
+        except APIError as exc:
+            raise SheetsError(self._explain_api_error(exc)) from exc
+
+        return self._parse_updated_range(result)
+
+    def update_cell(self, row: int, column: int, value: Any) -> None:
+        """Update satu sel. row/column memakai index 1-based (seperti di Sheets).
+
+        Contoh: update_cell(2, 5, "Sudah dihubungi") -> sel E2.
+        """
+        if row < 1 or column < 1:
+            raise ValueError(
+              

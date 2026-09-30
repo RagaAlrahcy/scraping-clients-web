@@ -1,0 +1,90 @@
+    @property
+    def label(self) -> str:
+        """Nama daerah yang enak dibaca (untuk terminal/log)."""
+        return self.display_name or self.city or self.query
+
+
+@dataclass
+class BusinessCandidate:
+    """Satu bisnis hasil discovery, siap dipetakan ke kolom Google Sheets."""
+
+    name: str
+    category: str = "-"
+    city: str = "-"
+    website: str = "-"
+    email: str = "-"
+    phone: str = "-"
+    address: str = "-"
+    status: str = "-"
+    osm_type: str = ""
+    osm_id: int = 0
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    source: str = "OpenStreetMap"
+
+    @property
+    def identity(self) -> str:
+        """Kunci anti-duplikat untuk bisnis tanpa website."""
+        return f"{normalize_text(self.name)}|{normalize_text(self.city)}"
+
+    def as_row(self) -> Dict[str, str]:
+        """Dict 8 kolom sesuai config.HEADERS."""
+        return {
+            "Nama Bisnis": self.name,
+            "Kategori": self.category,
+            "Kota": self.city,
+            "Website": self.website,
+            "Email": self.email,
+            "Nomor Telepon": self.phone,
+            "Alamat": self.address,
+            "Status": self.status,
+        }
+
+
+@dataclass
+class DiscoveryResult:
+    """Hasil satu kali discovery (selalu dikembalikan, tidak melempar error)."""
+
+    query: str
+    candidates: List[BusinessCandidate] = field(default_factory=list)
+    location: Optional[Location] = None
+    category: Optional[CategoryMatch] = None
+    errors: List[str] = field(default_factory=list)
+    overpass_url: str = ""
+    raw_count: int = 0
+    skipped_without_name: int = 0
+    duplicates_removed: int = 0
+
+    @property
+    def success(self) -> bool:
+        """True bila tahap geocode + Overpass berhasil (walau 0 hasil)."""
+        return not self.errors
+
+    @property
+    def error(self) -> Optional[str]:
+        return self.errors[0] if self.errors else None
+
+    @property
+    def category_label(self) -> str:
+        return self.category.category if self.category else "-"
+
+    @property
+    def place_label(self) -> str:
+        if self.location is not None:
+            return self.location.city or self.location.label
+        return "-"
+
+    @property
+    def with_website(self) -> int:
+        return sum(1 for item in self.candidates if item.website not in ("", "-"))
+
+
+# ---------------------------------------------------------------------------
+# BusinessDiscovery
+# ---------------------------------------------------------------------------
+class BusinessDiscovery:
+    """Cari bisnis dari OpenStreetMap berdasarkan kata kunci + nama daerah.
+
+    Pemakaian:
+        discovery = BusinessDiscovery()
+        result = discovery.discover("klinik jakarta selatan", limit=15)

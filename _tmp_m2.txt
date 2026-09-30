@@ -1,0 +1,111 @@
+        return
+
+    print(SEPARATOR)
+    print("RINGKASAN")
+    print(SEPARATOR)
+    print(f"{'No':<4}{'NAMA / URL':<46}{'STATUS':<16}{'BARIS':<7}")
+    print("-" * 72)
+    for index, item in enumerate(summaries, start=1):
+        label = str(item.get("name") or item.get("url") or "-")
+        short_label = label if len(label) <= 43 else label[:40] + "..."
+        row = item["row"] if item["row"] > 0 else "-"
+        print(f"{index:<4}{short_label:<46}{item['status']:<16}{str(row):<7}")
+
+    inserted = sum(1 for i in summaries if i["status"] == STATUS_INSERTED)
+    skipped = sum(1 for i in summaries if i["status"] == STATUS_SKIPPED)
+    failed = sum(1 for i in summaries if i["status"] == STATUS_FAILED)
+    dry = sum(1 for i in summaries if i["status"] == STATUS_DRY_RUN)
+
+    print("-" * 72)
+    line = (
+        f"Total: {len(summaries)} | INSERT: {inserted} | "
+        f"SKIP: {skipped} | GAGAL: {failed}"
+    )
+    if dry:
+        line += f" | DRY-RUN: {dry}"
+    print(line)
+
+    errors = [i for i in summaries if i["error"]]
+    if errors:
+        print("\nDetail error:")
+        for item in errors:
+            label = item.get("name") or item.get("url")
+            print(f"  - {label}: {item['error']}")
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Baca argumen command line."""
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description=(
+            "Discovery bisnis dari OpenStreetMap (Nominatim + Overpass) -> "
+            "scrape website -> INSERT ke Google Sheets."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Contoh:\n"
+            '  python main.py -q "klinik jakarta selatan"\n'
+            '  python main.py -q "apotek bandung" --limit 15 --dry-run\n'
+            "  python main.py --urls https://contoh.com https://contoh2.com\n"
+            "  python main.py --list-keywords\n"
+        ),
+    )
+    parser.add_argument(
+        "-q",
+        "--query",
+        default=None,
+        help=(
+            "Kalimat pencarian, mis. 'klinik jakarta selatan'. "
+            "Default: config.SCRAPE_QUERY."
+        ),
+    )
+    parser.add_argument(
+        "-l",
+        "--limit",
+        type=int,
+        default=None,
+        help=f"Jumlah maksimum bisnis (default: {config.DISCOVERY_LIMIT}).",
+    )
+    parser.add_argument(
+        "--urls",
+        nargs="+",
+        default=None,
+        metavar="URL",
+        help="Lewati discovery, langsung scrape URL ini (mode Tahap 2).",
+    )
+    parser.add_argument(
+        "--keyword",
+        default=None,
+        help="Paksa kategori tertentu, mis. 'apotek' (mengabaikan deteksi otomatis).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Jalankan discovery + scraping tanpa menulis ke Google Sheets.",
+    )
+    parser.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="Jangan scrape website bisnis untuk melengkapi email.",
+    )
+    parser.add_argument(
+        "--include-no-website",
+        action="store_true",
+        default=config.INCLUDE_NO_WEBSITE,
+        help=(
+            "Paksa ikut sertakan bisnis tanpa website (Website diisi '-'). "
+            f"Default: config.INCLUDE_NO_WEBSITE = {config.INCLUDE_NO_WEBSITE}."
+        ),
+    )
+    parser.add_argument(
+        "--list-keywords",
+        action="store_true",
+        help="Tampilkan daftar kata kunci kategori yang dikenali lalu keluar.",
+    )
+    return parser.parse_args(argv)
+
+
+def run_urls(
+    urls: Sequence[str],
+    scraper: WebsiteScraper,
+    manager: Optional[GoogleSheetsManager],

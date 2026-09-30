@@ -1,0 +1,83 @@
+    manager: Optional[GoogleSheetsManager],
+    dry_run: bool,
+) -> List[Dict[str, Any]]:
+    """Mode Tahap 2: scrape daftar URL manual lalu INSERT/SKIP."""
+    summaries: List[Dict[str, Any]] = []
+    total = len(urls)
+
+    for index, url in enumerate(urls, start=1):
+        print(SEPARATOR)
+        print(f"[{index}/{total}] Memproses: {url}")
+        try:
+            summaries.append(process_url(url, scraper, manager, dry_run=dry_run))
+        except Exception as exc:  # noqa: BLE001 - lapisan pengaman terakhir
+            print(f"     Fatal error pada URL ini: {exc}")
+            summaries.append(
+                {
+                    "url": url,
+                    "name": url,
+                    "status": STATUS_FAILED,
+                    "row": -1,
+                    "data": {},
+                    "error": f"Fatal error: {exc}",
+                }
+            )
+
+        # Delay sopan antar-request (kecuali URL terakhir).
+        if index < total and config.REQUEST_DELAY > 0:
+            time.sleep(config.REQUEST_DELAY)
+
+    return summaries
+
+
+def run_discovery(
+    args: argparse.Namespace,
+    scraper: WebsiteScraper,
+    manager: Optional[GoogleSheetsManager],
+) -> List[Dict[str, Any]]:
+    """Mode Tahap 3: discovery OSM -> scraping -> INSERT/SKIP."""
+    query = args.query or config.SCRAPE_QUERY
+    limit = args.limit if args.limit is not None else config.DISCOVERY_LIMIT
+    limit = max(int(limit), 1)
+
+    print(f"Query       : {query}")
+    print(f"Limit       : {limit}")
+    print(f"Mode        : {'DRY-RUN' if args.dry_run else 'TULIS ke Google Sheets'}")
+    print(SEPARATOR)
+
+    discovery = BusinessDiscovery(
+        timeout=config.DISCOVERY_TIMEOUT,
+        headers={"User-Agent": config.USER_AGENT},
+        nominatim_url=config.NOMINATIM_URL,
+        overpass_urls=config.OVERPASS_URLS,
+        delay=config.DISCOVERY_DELAY,
+        include_no_website=bool(args.include_no_website),
+        user_agent=config.USER_AGENT,
+    )
+
+    print("[1/3] Discovery di OpenStreetMap...")
+    result: DiscoveryResult = discovery.discover(
+        query,
+        limit=limit,
+        keyword=args.keyword,
+        enrich_emails=not args.no_enrich,
+        scraper=scraper,
+    )
+
+    for message in result.errors:
+        print(f"     [WARNING] {message}")
+
+    if result.location is not None:
+        print(f"     Daerah  : {result.location.city} ({result.location.label})")
+    print(f"     Kategori: {result.category_label}")
+    print(f"     Mirror  : {result.overpass_url or '-'}")
+    print(
+        f"     Ditemukan: {result.raw_count} elemen mentah | "
+        f"{len(result.candidates)} kandidat siap | "
+        f"{result.with_website} punya website | "
+        f"{result.duplicates_removed} duplikat dibuang | "
+        f"{result.skipped_without_name} tanpa nama"
+    )
+
+    if not result.candidates:
+        print("\n[WARNING] Tidak ada bisnis yang bisa diproses.")

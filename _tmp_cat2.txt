@@ -1,0 +1,153 @@
+64|     "pengacara": ("Pengacara", ('["office"="lawyer"]',)),
+65|     "asuransi": ("Asuransi", ('["office"="insurance"]',)),
+66|     "kantor": ("Kantor", ('["office"]',)),
+67|     # Pendidikan
+68|     "taman kanak-kanak": ("TK/PAUD", ('["amenity"="kindergarten"]',)),
+69|     "sekolah": ("Sekolah", ('["amenity"="school"]',)),
+70|     "kampus": ("Kampus", ('["amenity"~"^(university|college)$"]',)),
+71|     "universitas": ("Kampus", ('["amenity"~"^(university|college)$"]',)),
+72|     "kursus": ("Kursus", ('["amenity"="training"]', '["office"="educational_institution"]')),
+73|     # Umum / lain-lain
+74|     "bank": ("Bank", ('["amenity"="bank"]',)),
+75|     "atm": ("ATM", ('["amenity"="atm"]',)),
+76|     "hotel": ("Hotel", ('["tourism"="hotel"]',)),
+77|     "penginapan": ("Penginapan", ('["tourism"~"^(guest_house|hostel|motel)$"]',)),
+78|     "pabrik": ("Pabrik", ('["man_made"="works"]',)),
+79|     "gudang": ("Gudang", ('["building"="warehouse"]',)),
+80|     "masjid": ("Masjid", ('["amenity"="place_of_worship"]["religion"="muslim"]',)),
+81|     "gereja": ("Gereja", ('["amenity"="place_of_worship"]["religion"="christian"]',)),
+82| }
+83| 
+84| # Kata penghubung yang dibuang saat memisahkan nama daerah dari kalimat.
+85| _PLACE_STOPWORDS = (
+86|     "di",
+87|     "daerah",
+88|     "kawasan",
+89|     "area",
+90|     "wilayah",
+91|     "sekitar",
+92|     "sekitaran",
+93|     "dekat",
+94|     "dari",
+95| )
+96| 
+97| # Urutan pencocokan: frasa terpanjang lebih dulu supaya "klinik gigi"
+98| # menang atas "klinik", dan "rumah sakit" menang atas "rumah".
+99| _KEYWORD_ORDER: Tuple[str, ...] = tuple(
+100|     sorted(KEYWORD_MAP, key=lambda keyword: (-len(keyword), keyword))
+101| )
+102| 
+103| 
+104| @dataclass(frozen=True)
+105| class CategoryMatch:
+106|     """Hasil pencocokan kata kunci kategori.
+107| 
+108|     Attributes:
+109|         keyword: kata kunci yang dikenali (mis. "klinik").
+110|         category: label kategori untuk kolom Google Sheets (mis. "Klinik").
+111|         filters: daftar filter Overpass (OR antar filter).
+112|         fallback_name: True bila kata kunci tidak dikenal, sehingga pencarian
+113|             dilakukan lewat kecocokan nama (name~"...").
+114|     """
+115| 
+116|     keyword: str
+117|     category: str
+118|     filters: Tuple[str, ...]
+119|     fallback_name: bool = False
+120| 
+121| 
+122| def available_keywords() -> List[str]:
+123|     """Daftar kata kunci kategori yang dikenali (untuk --list-keywords)."""
+124|     return sorted(KEYWORD_MAP)
+125| 
+126| 
+127| def build_category(keyword: str) -> CategoryMatch:
+128|     """Buat CategoryMatch dari kata kunci.
+129| 
+130|     Kata kunci yang tidak ada di KEYWORD_MAP tetap didukung: pencarian
+131|     dilakukan dengan filter nama (name~"kata kunci").
+132|     """
+133|     key = normalize_text(keyword)
+134|     if not key:
+135|         raise ValueError("Kata kunci kategori tidak boleh kosong.")
+136| 
+137|     if key in KEYWORD_MAP:
+138|         label, filters = KEYWORD_MAP[key]
+139|         return CategoryMatch(keyword=key, category=label, filters=filters)
+140| 
+141|     return CategoryMatch(
+142|         keyword=key,
+143|         category=key.title(),
+144|         filters=(name_filter(key),),
+145|         fallback_name=True,
+146|     )
+147| 
+148| 
+149| def detect_keyword(text: str) -> Optional[CategoryMatch]:
+150|     """Cari kategori yang paling cocok di dalam kalimat bebas.
+151| 
+152|     Contoh: "klinik gigi di jakarta selatan" -> kategori "Dokter Gigi".
+153|     Return None bila tidak ada kata kunci yang dikenali.
+154|     """
+155|     haystack = normalize_text(text)
+156|     if not haystack:
+157|         return None
+158| 
+159|     for keyword in _KEYWORD_ORDER:
+160|         pattern = r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])"
+161|         if re.search(pattern, haystack):
+162|             return build_category(keyword)
+163| 
+164|     return None
+165| 
+166| 
+167| def strip_keyword(text: str, match: Optional[CategoryMatch]) -> str:
+168|     """Buang kata kunci kategori + kata penghubung, sisakan nama daerah."""
+169|     haystack = normalize_text(text)
+170|     if not haystack:
+171|         return ""
+172| 
+173|     if match is not None:
+174|         haystack = re.sub(
+175|             r"(?<![a-z0-9])" + re.escape(match.keyword) + r"(?![a-z0-9])",
+176|             " ",
+177|             haystack,
+178|         )
+179| 
+180|     tokens = [token for token in haystack.split() if token]
+181|     meaningful = [token for token in tokens if token not in _PLACE_STOPWORDS]
+182|     # Bila semua token adalah kata penghubung, pakai token apa adanya.
+183|     chosen = meaningful or tokens
+184|     return " ".join(chosen).strip(" ,;.-")
+185| 
+186| 
+187| def parse_query(text: str) -> Tuple[Optional[CategoryMatch], str]:
+188|     """Pisahkan kalimat pencarian menjadi (kategori, nama daerah).
+189| 
+190|     >>> parse_query("klinik di jakarta selatan")[1]
+191|     'jakarta selatan'
+192|     """
+193|     if text is None or not str(text).strip():
+194|         return None, ""
+195| 
+196|     raw = str(text).strip()
+197|     match = detect_keyword(raw)
+198|     place = strip_keyword(raw, match)
+199| 
+200|     if match is None:
+201|         # Tanpa kategori yang dikenali: seluruh kalimat dianggap nama daerah,
+202|         # dan pencarian bisnis memakai filter nama.
+203|         return None, place
+204| 
+205|     return match, place
+206| 
+207| 
+208| def name_filter(text: str) -> str:
+209|     """Filter Overpass berbasis nama (case-insensitive)."""
+210|     cleaned = normalize_text(text).replace("\\", "").replace('"', "")
+211|     return '["name"~"%s",i]' % cleaned
+212| 
+213| 
+214| # ---------------------------------------------------------------------------
+215| # Deteksi kategori dari tag OSM (kebalikan dari KEYWORD_MAP)
+216| # ---------------------------------------------------------------------------

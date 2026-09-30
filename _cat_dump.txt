@@ -1,0 +1,116 @@
+1: )
+2: 
+3: 
+4: @dataclass(frozen=True)
+5: class CategoryMatch:
+6:     """Hasil pencocokan kata kunci kategori.
+7: 
+8:     Attributes:
+9:         keyword: kata kunci yang dikenali (mis. "klinik").
+10:         category: label kategori untuk kolom Google Sheets (mis. "Klinik").
+11:         filters: daftar filter Overpass (OR antar filter).
+12:         fallback_name: True bila kata kunci tidak dikenal, sehingga pencarian
+13:             dilakukan lewat kecocokan nama (name~"...").
+14:     """
+15: 
+16:     keyword: str
+17:     category: str
+18:     filters: Tuple[str, ...]
+19:     fallback_name: bool = False
+20: 
+21: 
+22: def available_keywords() -> List[str]:
+23:     """Daftar kata kunci kategori yang dikenali (untuk --list-keywords)."""
+24:     return sorted(KEYWORD_MAP)
+25: 
+26: 
+27: def build_category(keyword: str) -> CategoryMatch:
+28:     """Buat CategoryMatch dari kata kunci.
+29: 
+30:     Kata kunci yang tidak ada di KEYWORD_MAP tetap didukung: pencarian
+31:     dilakukan dengan filter nama (name~"kata kunci").
+32:     """
+33:     key = normalize_text(keyword)
+34:     if not key:
+35:         raise ValueError("Kata kunci kategori tidak boleh kosong.")
+36: 
+37:     if key in KEYWORD_MAP:
+38:         label, filters = KEYWORD_MAP[key]
+39:         return CategoryMatch(keyword=key, category=label, filters=filters)
+40: 
+41:     return CategoryMatch(
+42:         keyword=key,
+43:         category=key.title(),
+44:         filters=(name_filter(key),),
+45:         fallback_name=True,
+46:     )
+47: 
+48: 
+49: def detect_keyword(text: str) -> Optional[CategoryMatch]:
+50:     """Cari kategori yang paling cocok di dalam kalimat bebas.
+51: 
+52:     Contoh: "klinik gigi di jakarta selatan" -> kategori "Dokter Gigi".
+53:     Return None bila tidak ada kata kunci yang dikenali.
+54:     """
+55:     haystack = normalize_text(text)
+56:     if not haystack:
+57:         return None
+58: 
+59:     for keyword in _KEYWORD_ORDER:
+60:         pattern = r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])"
+61:         if re.search(pattern, haystack):
+62:             return build_category(keyword)
+63: 
+64:     return None
+65: 
+66: 
+67: def strip_keyword(text: str, match: Optional[CategoryMatch]) -> str:
+68:     """Buang kata kunci kategori + kata penghubung, sisakan nama daerah."""
+69:     haystack = normalize_text(text)
+70:     if not haystack:
+71:         return ""
+72: 
+73:     if match is not None:
+74:         haystack = re.sub(
+75:             r"(?<![a-z0-9])" + re.escape(match.keyword) + r"(?![a-z0-9])",
+76:             " ",
+77:             haystack,
+78:         )
+79: 
+80:     tokens = [token for token in haystack.split() if token]
+81:     meaningful = [token for token in tokens if token not in _PLACE_STOPWORDS]
+82:     # Bila semua token adalah kata penghubung, pakai token apa adanya.
+83:     chosen = meaningful or tokens
+84:     return " ".join(chosen).strip(" ,;.-")
+85: 
+86: 
+87: def parse_query(text: str) -> Tuple[Optional[CategoryMatch], str]:
+88:     """Pisahkan kalimat pencarian menjadi (kategori, nama daerah).
+89: 
+90:     >>> parse_query("klinik di jakarta selatan")[1]
+91:     'jakarta selatan'
+92:     """
+93:     if text is None or not str(text).strip():
+94:         return None, ""
+95: 
+96:     raw = str(text).strip()
+97:     match = detect_keyword(raw)
+98:     place = strip_keyword(raw, match)
+99: 
+100:     if match is None:
+101:         # Tanpa kategori yang dikenali: seluruh kalimat dianggap nama daerah,
+102:         # dan pencarian bisnis memakai filter nama.
+103:         return None, place
+104: 
+105:     return match, place
+106: 
+107: 
+108: def name_filter(text: str) -> str:
+109:     """Filter Overpass berbasis nama (case-insensitive)."""
+110:     cleaned = normalize_text(text).replace("\\", "").replace('"', "")
+111:     return '["name"~"%s",i]' % cleaned
+112: 
+113: 
+114: # ---------------------------------------------------------------------------
+115: # Deteksi kategori dari tag OSM (kebalikan dari KEYWORD_MAP)
+116: # ---------------------------------------------------------------------------

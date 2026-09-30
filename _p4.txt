@@ -1,0 +1,26 @@
+85:     display_name: str
+86:     osm_type: str
+87:     osm_id: int
+88:     boundingbox: Tuple[float, float, float, float]  # (south, north, west, east)
+89:     city: str
+90:     addresstype: str = ""
+91:     place_type: str = ""
+92: 
+93:     @property
+94:     def area_id(self) -> Optional[int]:
+95:         """ID area Overpass (3600000000 + osm_id) untuk relation administratif."""
+96:         if self.osm_type == "relation" and self.osm_id > 0:
+97:             return 3600000000 + self.osm_id
+98:         return None
+99: 
+100:     @property
+101:     def bbox(self) -> str:
+102:         """Bounding box dalam format Overpass: south,west,north,east."""
+103:         south, north, west, east = self.boundingbox
+104:         return f"{south},{west},{north},{east}"
+105: 
+106:     @property
+107:     def label(self) -> str:
+108:         """Nama daerah yang enak dibaca (untuk terminal/log)."""
+109:         return self.display_name or self.city or self.query
+110: 
